@@ -1,4 +1,5 @@
 use crate::paths;
+use crate::sources::{self, ReadSignal};
 use crate::store::Store;
 use crate::tray;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -17,9 +18,14 @@ pub fn start(app: AppHandle, store: Store) {
             let _ = store.prune_handled();
         }
 
-        let Ok(unread) = store.unread_session_ids() else {
+        let Ok(unread) = store.unread_sessions() else {
             continue;
         };
+        let unread: Vec<String> = unread
+            .into_iter()
+            .filter(|(_, source)| sources::read_signal(source) == ReadSignal::Trusted)
+            .map(|(session_id, _)| session_id)
+            .collect();
         if unread.is_empty() {
             continue;
         }

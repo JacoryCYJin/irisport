@@ -1,6 +1,7 @@
 use crate::hooks_config;
 use crate::panel;
 use crate::paths;
+use crate::sources;
 use crate::store::{SessionView, Store};
 use serde::Serialize;
 use std::fs;
@@ -33,8 +34,22 @@ pub fn list_sessions(store: State<Store>) -> Result<Vec<SessionView>, String> {
 }
 
 #[tauri::command]
-pub fn open_session(session_id: String) -> Result<OpenResultView, String> {
-    let url = format!("codex://threads/{}", encode_component(&session_id));
+pub fn open_session(store: State<Store>, session_id: String) -> Result<OpenResultView, String> {
+    let Some(source) = store.session_source(&session_id)? else {
+        return Ok(OpenResultView {
+            ok: false,
+            message: Some("会话不存在".to_string()),
+        });
+    };
+    let Some(url) = sources::open_url(&source, &session_id) else {
+        return Ok(OpenResultView {
+            ok: false,
+            message: Some(format!(
+                "{} 暂不支持回到原会话",
+                sources::label(&source)
+            )),
+        });
+    };
     let result = Command::new("/usr/bin/open").arg(&url).output();
 
     match result {
@@ -221,19 +236,6 @@ fn hook_source(app: &AppHandle) -> Result<std::path::PathBuf, String> {
         return Ok(candidate);
     }
     Err("找不到 irisport-hook 二进制，请先运行 scripts/prepare-hook.sh".to_string())
-}
-
-fn encode_component(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        let allowed = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
-        if allowed {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
 }
 
 fn now_ms() -> i64 {

@@ -37,7 +37,7 @@ const timeLabel = computed(() => {
       <span class="session-top">
         <span class="source">
           <span v-if="session.unread" class="unread-dot"></span>
-          Codex
+          {{ session.source_label }}
         </span>
         <span class="session-meta">
           <span class="time">{{ timeLabel }}</span>
