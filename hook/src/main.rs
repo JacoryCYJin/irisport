@@ -4,10 +4,12 @@ use std::io::{BufRead, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_INPUT: u64 = 1_000_000;
 const PROMPT_LIMIT: usize = 200;
+static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     let _ = run();
@@ -61,12 +63,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if source.code != "desktop" {
-        let record = serde_json::json!({ "t": now, "source": source.code });
-        append_json(&home.join("events/rejected.jsonl"), &record)?;
-        return Ok(());
-    }
-
     let mut record = serde_json::json!({
         "t": now,
         "event": event,
@@ -79,7 +75,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             record["prompt"] = serde_json::Value::String(excerpt(prompt));
         }
     }
-    append_json(&home.join("events/queue.jsonl"), &record)?;
+    write_inbox_event(&home, &record)?;
     Ok(())
 }
 
@@ -243,6 +239,29 @@ fn support_home() -> PathBuf {
         Some(home) => PathBuf::from(home).join("Library/Application Support/Irisport"),
         None => PathBuf::from("/tmp/irisport"),
     }
+}
+
+fn write_inbox_event(home: &Path, value: &serde_json::Value) -> std::io::Result<()> {
+    let dir = home.join("events/inbox");
+    fs::create_dir_all(&dir)?;
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+
+    let mut line = serde_json::to_string(value).unwrap_or_default();
+    line.push('\n');
+    let unique = FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let base = format!("{}-{}-{unique}", now_ms(), std::process::id());
+    let final_path = dir.join(format!("{base}.json"));
+    let temp_path = dir.join(format!(".{base}.tmp"));
+
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp_path)?;
+    let _ = fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600));
+    file.write_all(line.as_bytes())?;
+    drop(file);
+    fs::rename(&temp_path, &final_path)?;
+    Ok(())
 }
 
 fn append_json(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {

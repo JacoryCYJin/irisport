@@ -1,10 +1,16 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type StoreResult<T> = Result<T, String>;
+
+const SEEN_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+const SEEN_LIMIT: i64 = 50;
+const HANDLED_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+const HANDLED_LIMIT: i64 = 500;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HookEvent {
@@ -69,11 +75,19 @@ impl Store {
                processed_at INTEGER NOT NULL,
                UNIQUE(session_id, turn_id, kind)
              );
+             CREATE TABLE IF NOT EXISTS handled_turns (
+               session_id TEXT NOT NULL,
+               turn_id TEXT NOT NULL,
+               handled_at INTEGER NOT NULL,
+               PRIMARY KEY(session_id, turn_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_handled_turns_at
+               ON handled_turns(handled_at);
              CREATE TABLE IF NOT EXISTS meta (
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL
              );
-             PRAGMA user_version = 1;",
+             PRAGMA user_version = 2;",
         )
         .map_err(|error| error.to_string())?;
         Ok(Self {
@@ -96,6 +110,21 @@ impl Store {
 
         let mut conn = self.lock()?;
         let tx = conn.transaction().map_err(|error| error.to_string())?;
+
+        if kind == "stop" {
+            let handled: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM handled_turns WHERE session_id = ?1 AND turn_id = ?2",
+                    params![event.session_id, event.turn_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if handled.is_some() {
+                tx.commit().map_err(|error| error.to_string())?;
+                return Ok(false);
+            }
+        }
 
         let inserted = tx
             .execute(
@@ -137,13 +166,14 @@ impl Store {
                 tx.execute(
                     "INSERT INTO sessions(
                        session_id, source, prompt_excerpt, last_prompt_at,
-                       last_result_at, result_seq, unread, updated_at
-                     ) VALUES (?1, ?2, NULL, NULL, ?3, 1, 1, ?3)
+                       last_result_at, result_seq, unread, opened_at, updated_at
+                     ) VALUES (?1, ?2, NULL, NULL, ?3, 1, 1, NULL, ?3)
                      ON CONFLICT(session_id) DO UPDATE SET
                        source = excluded.source,
                        last_result_at = excluded.last_result_at,
                        result_seq = sessions.result_seq + 1,
                        unread = 1,
+                       opened_at = NULL,
                        updated_at = excluded.updated_at",
                     params![event.session_id, source, event.t],
                 )
@@ -185,9 +215,8 @@ impl Store {
                 "SELECT session_id, source, prompt_excerpt, last_prompt_at,
                         last_result_at, result_seq, unread, updated_at
                  FROM sessions
-                 ORDER BY unread DESC,
-                          COALESCE(last_result_at, last_prompt_at, updated_at) DESC
-                 LIMIT 50",
+                 WHERE unread = 1
+                 ORDER BY COALESCE(last_result_at, updated_at) DESC",
             )
             .map_err(|error| error.to_string())?;
 
@@ -223,17 +252,6 @@ impl Store {
         .map_err(|error| error.to_string())
     }
 
-    pub fn session_state(&self, session_id: &str) -> StoreResult<Option<(bool, i64)>> {
-        let conn = self.lock()?;
-        conn.query_row(
-            "SELECT unread, result_seq FROM sessions WHERE session_id = ?1",
-            params![session_id],
-            |row| Ok((row.get::<_, i64>(0)? != 0, row.get(1)?)),
-        )
-        .optional()
-        .map_err(|error| error.to_string())
-    }
-
     pub fn unread_session_ids(&self) -> StoreResult<Vec<String>> {
         let conn = self.lock()?;
         let mut statement = conn
@@ -255,6 +273,34 @@ impl Store {
         let now = now_ms();
         let mut updated = 0;
         for session_id in session_ids {
+            let mut turn_ids = Vec::new();
+            {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT turn_id FROM events
+                         WHERE session_id = ?1 AND kind = 'stop'",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let rows = statement
+                    .query_map(params![session_id], |row| row.get::<_, String>(0))
+                    .map_err(|error| error.to_string())?;
+                for row in rows {
+                    turn_ids.push(row.map_err(|error| error.to_string())?);
+                }
+            }
+            for turn_id in turn_ids {
+                tx.execute(
+                    "INSERT OR IGNORE INTO handled_turns(session_id, turn_id, handled_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![session_id, turn_id, now],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            tx.execute(
+                "DELETE FROM events WHERE session_id = ?1",
+                params![session_id],
+            )
+            .map_err(|error| error.to_string())?;
             updated += tx
                 .execute(
                     "UPDATE sessions SET unread = 0, opened_at = ?1
@@ -267,25 +313,181 @@ impl Store {
         Ok(updated)
     }
 
-    pub fn mark_all_seen(&self) -> StoreResult<usize> {
-        let conn = self.lock()?;
-        conn.execute(
-            "UPDATE sessions SET unread = 0, opened_at = ?1 WHERE unread = 1",
-            params![now_ms()],
-        )
-        .map_err(|error| error.to_string())
-    }
+    pub fn prune_seen(&self) -> StoreResult<usize> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let cutoff = now_ms() - SEEN_RETENTION_MS;
+        let mut ids = HashSet::new();
 
-    pub fn clear_if_version(&self, session_id: &str, expected_seq: i64) -> StoreResult<bool> {
-        let conn = self.lock()?;
-        let updated = conn
-            .execute(
-                "UPDATE sessions SET unread = 0, opened_at = ?1
-                 WHERE session_id = ?2 AND result_seq = ?3 AND unread = 1",
-                params![now_ms(), session_id, expected_seq],
+        {
+            let mut statement = tx
+                .prepare(
+                    "SELECT session_id FROM sessions
+                     WHERE unread = 0
+                       AND last_result_at IS NOT NULL
+                       AND COALESCE(last_prompt_at, 0) <= COALESCE(last_result_at, 0)
+                       AND COALESCE(opened_at, 0) < ?1",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map(params![cutoff], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?;
+            for row in rows {
+                ids.insert(row.map_err(|error| error.to_string())?);
+            }
+        }
+
+        {
+            let mut statement = tx
+                .prepare(
+                    "SELECT session_id FROM sessions
+                     WHERE unread = 0
+                       AND last_result_at IS NOT NULL
+                       AND COALESCE(last_prompt_at, 0) <= COALESCE(last_result_at, 0)
+                     ORDER BY COALESCE(opened_at, 0) DESC
+                     LIMIT -1 OFFSET ?1",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map(params![SEEN_LIMIT], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?;
+            for row in rows {
+                ids.insert(row.map_err(|error| error.to_string())?);
+            }
+        }
+
+        for session_id in &ids {
+            tx.execute(
+                "DELETE FROM events WHERE session_id = ?1",
+                params![session_id],
             )
             .map_err(|error| error.to_string())?;
-        Ok(updated > 0)
+            tx.execute(
+                "DELETE FROM sessions WHERE session_id = ?1",
+                params![session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(ids.len())
+    }
+
+    pub fn prune_handled(&self) -> StoreResult<usize> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let cutoff = now_ms() - HANDLED_RETENTION_MS;
+        let mut removed = tx
+            .execute(
+                "DELETE FROM handled_turns WHERE handled_at < ?1",
+                params![cutoff],
+            )
+            .map_err(|error| error.to_string())?;
+        removed += tx
+            .execute(
+                "DELETE FROM handled_turns WHERE rowid IN (
+                   SELECT rowid FROM handled_turns
+                   ORDER BY handled_at DESC
+                   LIMIT -1 OFFSET ?1
+                 )",
+                params![HANDLED_LIMIT],
+            )
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(removed)
+    }
+
+    pub fn migrate_seen_events(&self) -> StoreResult<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let now = now_ms();
+
+        tx.execute(
+            "UPDATE sessions SET opened_at = ?1
+             WHERE unread = 0 AND last_result_at IS NOT NULL AND opened_at IS NULL",
+            params![now],
+        )
+        .map_err(|error| error.to_string())?;
+
+        let mut seen_ids = Vec::new();
+        {
+            let mut statement = tx
+                .prepare(
+                    "SELECT session_id FROM sessions
+                     WHERE unread = 0
+                       AND last_result_at IS NOT NULL
+                       AND COALESCE(last_prompt_at, 0) <= COALESCE(last_result_at, 0)",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?;
+            for row in rows {
+                seen_ids.push(row.map_err(|error| error.to_string())?);
+            }
+        }
+
+        for session_id in seen_ids {
+            let mut turn_ids = Vec::new();
+            {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT turn_id FROM events
+                         WHERE session_id = ?1 AND kind = 'stop'",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let rows = statement
+                    .query_map(params![session_id], |row| row.get::<_, String>(0))
+                    .map_err(|error| error.to_string())?;
+                for row in rows {
+                    turn_ids.push(row.map_err(|error| error.to_string())?);
+                }
+            }
+            for turn_id in turn_ids {
+                tx.execute(
+                    "INSERT OR IGNORE INTO handled_turns(session_id, turn_id, handled_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![session_id, turn_id, now],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            tx.execute(
+                "DELETE FROM events WHERE session_id = ?1",
+                params![session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn storage_version(&self) -> StoreResult<i64> {
+        Ok(self
+            .meta_get("storage_version")?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(1))
+    }
+
+    pub fn set_storage_version(&self, version: i64) -> StoreResult<()> {
+        self.meta_set("storage_version", &version.to_string())
+    }
+
+    pub fn increment_rejected(&self) -> StoreResult<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('rejected_count', '1')
+             ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn session_count(&self) -> StoreResult<i64> {
+        let conn = self.lock()?;
+        conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .map_err(|error| error.to_string())
     }
 
     pub fn meta_get(&self, key: &str) -> StoreResult<Option<String>> {
@@ -308,6 +510,20 @@ impl Store {
         .map_err(|error| error.to_string())?;
         Ok(())
     }
+
+    pub fn meta_remove(&self, key: &str) -> StoreResult<()> {
+        let conn = self.lock()?;
+        conn.execute("DELETE FROM meta WHERE key = ?1", params![key])
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn compact_database(&self) -> StoreResult<()> {
+        let conn = self.lock()?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
 }
 
 fn now_ms() -> i64 {
@@ -325,94 +541,170 @@ mod tests {
         Store::init(Connection::open_in_memory().unwrap()).unwrap()
     }
 
-    fn event(kind: &str, turn: &str, t: i64) -> HookEvent {
+    fn event(kind: &str, session: &str, turn: &str, t: i64) -> HookEvent {
         HookEvent {
             t,
             event: kind.to_string(),
-            session_id: "s1".to_string(),
+            session_id: session.to_string(),
             turn_id: turn.to_string(),
             source: "desktop".to_string(),
             prompt: Some("帮我整理发布清单并且检查所有阻塞项".to_string()),
         }
     }
 
+    fn set_opened_at(store: &Store, session: &str, value: i64) {
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET opened_at = ?1 WHERE session_id = ?2",
+                params![value, session],
+            )
+            .unwrap();
+    }
+
     #[test]
-    fn prompt_then_stop_marks_unread() {
+    fn prompt_then_stop_shows_in_list() {
         let store = store();
-        assert!(store.apply(&event("UserPromptSubmit", "t1", 100)).unwrap());
-        assert_eq!(store.count_unread().unwrap(), 0);
-        assert!(store.apply(&event("Stop", "t1", 200)).unwrap());
-        assert_eq!(store.count_unread().unwrap(), 1);
+        store
+            .apply(&event("UserPromptSubmit", "s1", "t1", 100))
+            .unwrap();
+        assert!(store.list_sessions().unwrap().is_empty());
+        store.apply(&event("Stop", "s1", "t1", 200)).unwrap();
         let sessions = store.list_sessions().unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].result_seq, 1);
-        assert!(!sessions[0].pending);
     }
 
     #[test]
-    fn duplicate_stop_is_ignored() {
+    fn seen_session_hides_but_is_retained() {
         let store = store();
-        store.apply(&event("Stop", "t1", 200)).unwrap();
-        assert!(!store.apply(&event("Stop", "t1", 300)).unwrap());
-        assert_eq!(store.list_sessions().unwrap()[0].result_seq, 1);
+        store.apply(&event("Stop", "s1", "t1", 200)).unwrap();
+        assert_eq!(
+            store.mark_seen_sessions(&["s1".to_string()]).unwrap(),
+            1
+        );
+        assert!(store.list_sessions().unwrap().is_empty());
+        assert_eq!(store.session_count().unwrap(), 1);
+        assert_eq!(store.count_unread().unwrap(), 0);
     }
 
     #[test]
-    fn second_turn_increments_result_version() {
+    fn duplicate_stop_after_seen_is_ignored() {
         let store = store();
-        store.apply(&event("Stop", "t1", 200)).unwrap();
-        store.apply(&event("UserPromptSubmit", "t2", 300)).unwrap();
-        store.apply(&event("Stop", "t2", 400)).unwrap();
+        store.apply(&event("Stop", "s1", "t1", 200)).unwrap();
+        store.mark_seen_sessions(&["s1".to_string()]).unwrap();
+        assert!(!store.apply(&event("Stop", "s1", "t1", 300)).unwrap());
+        assert!(store.list_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn new_turn_after_seen_reappears() {
+        let store = store();
+        store.apply(&event("Stop", "s1", "t1", 200)).unwrap();
+        store.mark_seen_sessions(&["s1".to_string()]).unwrap();
+        store
+            .apply(&event("UserPromptSubmit", "s1", "t2", 300))
+            .unwrap();
+        assert!(store.list_sessions().unwrap().is_empty());
+        store.apply(&event("Stop", "s1", "t2", 400)).unwrap();
         let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].result_seq, 2);
-        assert!(sessions[0].unread);
     }
 
     #[test]
-    fn clear_only_matches_clicked_version() {
+    fn prune_keeps_unread_and_pending() {
         let store = store();
-        store.apply(&event("Stop", "t1", 200)).unwrap();
-        assert!(store.clear_if_version("s1", 1).unwrap());
-        assert_eq!(store.count_unread().unwrap(), 0);
-        store.apply(&event("Stop", "t2", 300)).unwrap();
-        assert!(!store.clear_if_version("s1", 1).unwrap());
-        assert_eq!(store.count_unread().unwrap(), 1);
+        store.apply(&event("Stop", "unread", "t1", 200)).unwrap();
+        store
+            .apply(&event("UserPromptSubmit", "pending", "t2", 300))
+            .unwrap();
+        store
+            .apply(&event("Stop", "pending", "t3", 400))
+            .unwrap();
+        store
+            .apply(&event("UserPromptSubmit", "pending", "t4", 500))
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET opened_at = 1 WHERE session_id = 'pending'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.prune_seen().unwrap(), 0);
+        assert_eq!(store.session_count().unwrap(), 2);
     }
 
     #[test]
-    fn pending_state_tracks_new_prompt() {
+    fn prune_seen_removes_old_and_excess() {
         let store = store();
-        store.apply(&event("Stop", "t1", 200)).unwrap();
-        store.apply(&event("UserPromptSubmit", "t2", 300)).unwrap();
-        let sessions = store.list_sessions().unwrap();
-        assert!(sessions[0].pending);
-        assert!(sessions[0].unread);
+        let recent = now_ms() - 100_000;
+        for index in 0..55 {
+            let session = format!("s{index}");
+            store
+                .apply(&event("Stop", &session, &format!("t{index}"), 1000 + index))
+                .unwrap();
+            store
+                .mark_seen_sessions(&[session.clone()])
+                .unwrap();
+            set_opened_at(&store, &session, recent + index);
+        }
+        assert_eq!(store.prune_seen().unwrap(), 5);
+        assert_eq!(store.session_count().unwrap(), 50);
+
+        store
+            .apply(&event("Stop", "old", "t-old", 10))
+            .unwrap();
+        store.mark_seen_sessions(&["old".to_string()]).unwrap();
+        set_opened_at(&store, "old", now_ms() - SEEN_RETENTION_MS - 1);
+        assert_eq!(store.prune_seen().unwrap(), 1);
+        assert!(!store
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .any(|row| row.session_id == "old"));
     }
 
     #[test]
-    fn opening_panel_marks_all_seen() {
+    fn list_includes_more_than_fifty_unread() {
         let store = store();
-        let mut a = event("Stop", "t1", 100);
-        a.session_id = "a".to_string();
-        store.apply(&a).unwrap();
-        let mut b = event("Stop", "t1", 200);
-        b.session_id = "b".to_string();
-        store.apply(&b).unwrap();
-        assert_eq!(store.mark_all_seen().unwrap(), 2);
-        assert_eq!(store.count_unread().unwrap(), 0);
+        for index in 0..60 {
+            store
+                .apply(&event(
+                    "Stop",
+                    &format!("s{index}"),
+                    &format!("t{index}"),
+                    1000 + index,
+                ))
+                .unwrap();
+        }
+        assert_eq!(store.list_sessions().unwrap().len(), 60);
     }
 
     #[test]
-    fn unread_sessions_sort_first() {
+    fn handled_turns_are_capped() {
         let store = store();
-        let mut a = event("Stop", "t1", 100);
-        a.session_id = "a".to_string();
-        store.apply(&a).unwrap();
-        store.clear_if_version("a", 1).unwrap();
-        let mut b = event("Stop", "t1", 200);
-        b.session_id = "b".to_string();
-        store.apply(&b).unwrap();
-        let sessions = store.list_sessions().unwrap();
-        assert_eq!(sessions[0].session_id, "b");
+        let recent = now_ms() - 100_000;
+        {
+            let conn = store.lock().unwrap();
+            for index in 0..510 {
+                conn.execute(
+                    "INSERT INTO handled_turns(session_id, turn_id, handled_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![format!("s{index}"), format!("t{index}"), recent + index],
+                )
+                .unwrap();
+            }
+        }
+        store.prune_handled().unwrap();
+        let count: i64 = store
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM handled_turns", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 500);
     }
 }

@@ -7,8 +7,15 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
 pub fn start(app: AppHandle, store: Store) {
-    thread::spawn(move || loop {
+    thread::spawn(move || {
+        let mut ticks = 0u64;
+        loop {
         thread::sleep(Duration::from_millis(500));
+        ticks += 1;
+        if ticks % 1200 == 0 {
+            let _ = store.prune_seen();
+            let _ = store.prune_handled();
+        }
 
         let Ok(unread) = store.unread_session_ids() else {
             continue;
@@ -50,10 +57,13 @@ pub fn start(app: AppHandle, store: Store) {
             if updated == 0 {
                 continue;
             }
+            let _ = store.prune_seen();
+            let _ = store.prune_handled();
             if let Ok(count) = store.count_unread() {
                 tray::set_count(&app, count);
             }
             let _ = app.emit("sessions-updated", ());
+        }
         }
     });
 }

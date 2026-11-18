@@ -4,6 +4,7 @@ mod codex;
 mod codex_state;
 mod commands;
 mod hooks_config;
+mod migration;
 mod panel;
 mod paths;
 mod store;
@@ -14,6 +15,9 @@ use tauri::Manager;
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            panel::toggle(app, None);
+        }))
         .setup(|app| {
             setup(app).map_err(|error| {
                 Box::new(std::io::Error::other(error)) as Box<dyn std::error::Error>
@@ -33,6 +37,8 @@ fn main() {
             commands::uninstall_codex_hooks,
             commands::hook_status,
             commands::hide_panel,
+            commands::set_panel_height,
+            commands::open_settings,
             commands::open_codex_settings
         ])
         .run(tauri::generate_context!())
@@ -47,6 +53,14 @@ fn setup(app: &mut tauri::App) -> Result<(), String> {
 
     paths::ensure_dirs().map_err(|error| error.to_string())?;
     let store = Store::open(paths::db_path())?;
+
+    if let Err(error) = commands::refresh_hook_binary(app.handle()) {
+        eprintln!("irisport: 更新 hook 二进制失败: {error}");
+    }
+    if let Err(error) = migration::run(&store) {
+        eprintln!("irisport: 数据迁移未完成: {error}");
+    }
+
     let count = store.count_unread().unwrap_or(0);
 
     if let Some(window) = app.get_webview_window("panel") {

@@ -59,6 +59,139 @@ function encodePng(width, height, rgba) {
   ]);
 }
 
+function flattenCurve(start, curves) {
+  const points = [start];
+  let [x, y] = start;
+  for (const [ax, ay, bx, by, endX, endY] of curves) {
+    for (let step = 1; step <= 20; step += 1) {
+      const t = step / 20;
+      const s = 1 - t;
+      points.push([
+        s ** 3 * x + 3 * s ** 2 * t * ax + 3 * s * t ** 2 * bx + t ** 3 * endX,
+        s ** 3 * y + 3 * s ** 2 * t * ay + 3 * s * t ** 2 * by + t ** 3 * endY,
+      ]);
+    }
+    x = endX;
+    y = endY;
+  }
+  return points;
+}
+
+function coversStroke(points, x, y, radiusSquared) {
+  for (let i = 1; i < points.length; i += 1) {
+    const [startX, startY] = points[i - 1];
+    const [endX, endY] = points[i];
+    const dx = endX - startX;
+    const dy = endY - startY;
+    const offsetX = x - startX;
+    const offsetY = y - startY;
+    const fraction = (offsetX * dx + offsetY * dy) / (dx * dx + dy * dy);
+    const t = Math.min(1, Math.max(0, fraction));
+    if ((offsetX - t * dx) ** 2 + (offsetY - t * dy) ** 2 <= radiusSquared) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function containsPoint(points, x, y) {
+  let inside = false;
+  for (let i = 1; i < points.length; i += 1) {
+    const [startX, startY] = points[i - 1];
+    const [endX, endY] = points[i];
+    if ((startY > y) !== (endY > y)) {
+      const crossingX = startX + ((y - startY) * (endX - startX)) / (endY - startY);
+      if (x < crossingX) inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function writeTrayIcons() {
+  const canvasPoints = 18;
+  const pixels = canvasPoints * 2;
+  const samples = 4;
+  const filenames = ["tray.png", "tray-lit.png", "tray-lit-medium.png", "tray-lit-high.png"];
+  const images = filenames.map(() => Buffer.alloc(pixels * pixels * 4));
+
+  // Bulb and socket, drawn in point coordinates with a 1.6 pt stroke.
+  const outline = flattenCurve([6.25, 11.7], [
+    [6.25, 10.6, 5.65, 10, 4.9, 9.2],
+    [4.18, 8.42, 3.85, 7.45, 3.85, 6.35],
+    [3.85, 3.65, 6.12, 1.9, 9, 1.9],
+    [11.88, 1.9, 14.15, 3.65, 14.15, 6.35],
+    [14.15, 7.45, 13.82, 8.42, 13.1, 9.2],
+    [12.35, 10, 11.75, 10.6, 11.75, 11.7],
+  ]);
+  outline.push([11.75, 12.65], [6.25, 12.65], [6.25, 11.7]);
+  const base = [[6.85, 15.1], [11.15, 15.1]];
+  const filament = flattenCurve([6.6, 6.25], [
+    [7.55, 6.1, 7.89, 8.45, 9, 8.5],
+    [10.11, 8.45, 10.45, 6.1, 11.4, 6.25],
+  ]);
+  const support = [[9, 8.45], [9, 10.05]];
+  const radiusSquared = 0.8 ** 2;
+
+  function opacityAt(x, y) {
+    if (
+      coversStroke(outline, x, y, radiusSquared) ||
+      coversStroke(base, x, y, radiusSquared)
+    ) {
+      return [1, 1, 1, 1];
+    }
+    if (!containsPoint(outline, x, y)) return [0, 0, 0, 0];
+    if (coversStroke(filament, x, y, 0.6 ** 2)) return [0, 1, 1, 1];
+    if (coversStroke(support, x, y, 0.36 ** 2)) return [0, 0.8, 0.8, 0.8];
+
+    const halo = 0.38 * Math.exp(-(((x - 9) / 3.4) ** 2 + ((y - 7) / 3.85) ** 2));
+    const fade = Math.min(1, Math.max(0, (12.5 - y) / 9.5));
+    const glass = Math.max(halo, Math.min(0.58, 0.12 + 0.48 * fade));
+    return [0, 0, halo, glass];
+  }
+
+  const pointsPerSample = canvasPoints / (pixels * samples);
+  for (let y = 0; y < pixels; y += 1) {
+    for (let x = 0; x < pixels; x += 1) {
+      const coverage = [0, 0, 0, 0];
+      for (let dy = 0; dy < samples; dy += 1) {
+        for (let dx = 0; dx < samples; dx += 1) {
+          const sampleX = (x * samples + dx + 0.5) * pointsPerSample;
+          const sampleY = (y * samples + dy + 0.5) * pointsPerSample;
+          const opacity = opacityAt(sampleX, sampleY);
+          for (let level = 0; level < images.length; level += 1) {
+            coverage[level] += opacity[level];
+          }
+        }
+      }
+      const alphaIndex = (y * pixels + x) * 4 + 3;
+      for (let level = 0; level < images.length; level += 1) {
+        images[level][alphaIndex] = Math.round((255 * coverage[level]) / (samples * samples));
+      }
+    }
+  }
+  const crop = 2;
+  const croppedWidth = pixels - crop * 2;
+  for (const [level, filename] of filenames.entries()) {
+    const source = images[level];
+    const cropped = Buffer.alloc(croppedWidth * pixels * 4);
+    for (let y = 0; y < pixels; y += 1) {
+      const sourceStart = (y * pixels + crop) * 4;
+      const targetStart = y * croppedWidth * 4;
+      source.copy(cropped, targetStart, sourceStart, sourceStart + croppedWidth * 4);
+    }
+    writeFileSync(
+      resolve(outDir, filename),
+      encodePng(croppedWidth, pixels, cropped),
+    );
+  }
+}
+
+if (process.argv.includes("--tray-only")) {
+  writeTrayIcons();
+  console.log(`tray icons written: ${outDir}`);
+  process.exit(0);
+}
+
 function blend(dst, index, r, g, b, a) {
   const alpha = a / 255;
   const inv = 1 - alpha;
@@ -161,27 +294,6 @@ const appPng = draw(appSize, (set, hi) => {
 });
 
 writeFileSync(resolve(outDir, "icon.png"), appPng);
-
-const traySize = 36;
-const trayPng = draw(traySize, (set, hi) => {
-  const center = hi / 2;
-  const ringRadius = hi * 0.28;
-  const ringWidth = hi * 0.085;
-  for (let y = 0; y < hi; y += 1) {
-    for (let x = 0; x < hi; x += 1) {
-      const dx = x - center;
-      const dy = y - center;
-      const distance = Math.sqrt(dx * dx + dy * dy);
-      if (Math.abs(distance - ringRadius) <= ringWidth / 2) {
-        set(x, y, 0, 0, 0, 255);
-      }
-      if (distance <= hi * 0.1) {
-        set(x, y, 0, 0, 0, 255);
-      }
-    }
-  }
-});
-
-writeFileSync(resolve(outDir, "tray.png"), trayPng);
+writeTrayIcons();
 
 console.log(`icons written: ${outDir}`);

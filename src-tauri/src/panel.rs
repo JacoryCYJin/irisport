@@ -1,6 +1,3 @@
-use crate::store::Store;
-use crate::tray;
-use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, Position, Size, WebviewWindow};
 
 pub fn toggle(app: &AppHandle, rect: Option<tauri::Rect>) {
@@ -25,48 +22,6 @@ pub fn toggle(app: &AppHandle, rect: Option<tauri::Rect>) {
     let _ = window.show();
     let _ = window.set_focus();
     let _ = app.emit("panel-opened", ());
-    mark_seen_after_open(app.clone());
-}
-
-pub fn mark_seen_after_open(app: AppHandle) {
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(700));
-        let Some(window) = app.get_webview_window("panel") else {
-            return;
-        };
-        if !window.is_visible().unwrap_or(false) {
-            return;
-        }
-        apply_seen(&app);
-    });
-}
-
-pub fn mark_seen_if_focused(app: &AppHandle) {
-    let app = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(700));
-        let Some(window) = app.get_webview_window("panel") else {
-            return;
-        };
-        if !(window.is_visible().unwrap_or(false) && window.is_focused().unwrap_or(false)) {
-            return;
-        }
-        apply_seen(&app);
-    });
-}
-
-fn apply_seen(app: &AppHandle) {
-    let store = app.state::<Store>();
-    let Ok(updated) = store.mark_all_seen() else {
-        return;
-    };
-    if updated == 0 {
-        return;
-    }
-    if let Ok(count) = store.count_unread() {
-        tray::set_count(app, count);
-    }
-    let _ = app.emit("sessions-updated", ());
 }
 
 pub fn hide(app: &AppHandle) {
