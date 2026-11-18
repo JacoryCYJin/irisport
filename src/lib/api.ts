@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 export interface SessionView {
   session_id: string;
   source: string;
+  source_label: string;
   prompt_excerpt: string | null;
   last_prompt_at: number | null;
   last_result_at: number | null;

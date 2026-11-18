@@ -7,6 +7,7 @@ mod hooks_config;
 mod migration;
 mod panel;
 mod paths;
+mod sources;
 mod store;
 mod tray;
 

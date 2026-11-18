@@ -1,3 +1,4 @@
+use crate::sources;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -28,6 +29,7 @@ pub struct HookEvent {
 pub struct SessionView {
     pub session_id: String,
     pub source: String,
+    pub source_label: String,
     pub prompt_excerpt: Option<String>,
     pub last_prompt_at: Option<i64>,
     pub last_result_at: Option<i64>,
@@ -224,9 +226,12 @@ impl Store {
             .query_map([], |row| {
                 let last_prompt_at: Option<i64> = row.get(3)?;
                 let last_result_at: Option<i64> = row.get(4)?;
+                let source: String = row.get(1)?;
+                let source_label = sources::label(&source).to_string();
                 Ok(SessionView {
                     session_id: row.get(0)?,
-                    source: row.get(1)?,
+                    source,
+                    source_label,
                     prompt_excerpt: row.get(2)?,
                     last_prompt_at,
                     last_result_at,
@@ -252,16 +257,27 @@ impl Store {
         .map_err(|error| error.to_string())
     }
 
-    pub fn unread_session_ids(&self) -> StoreResult<Vec<String>> {
+    pub fn unread_sessions(&self) -> StoreResult<Vec<(String, String)>> {
         let conn = self.lock()?;
         let mut statement = conn
-            .prepare("SELECT session_id FROM sessions WHERE unread = 1")
+            .prepare("SELECT session_id, source FROM sessions WHERE unread = 1")
             .map_err(|error| error.to_string())?;
         let rows = statement
-            .query_map([], |row| row.get(0))
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())
+    }
+
+    pub fn session_source(&self, session_id: &str) -> StoreResult<Option<String>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT source FROM sessions WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())
     }
 
     pub fn mark_seen_sessions(&self, session_ids: &[String]) -> StoreResult<usize> {
