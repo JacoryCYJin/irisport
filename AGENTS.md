@@ -15,6 +15,8 @@
 - 运行时数据统一放在 `~/Library/Application Support/Irisport/`，不写入仓库。
 - 生产事件只保存请求短摘录；探针只保存事件类型、会话与轮次 ID、时间、来源判定和回跳结果。
 - 已读判断只读 Codex 状态库中 `thread_read_receipts` 的 `thread_id` 与 `first_unread_turn`，不读取对话内容。
+- 只有 Codex 中实际查看聊天才清除提醒；Irisport 面板打开、聚焦或点击任务行都不改变提醒状态。
+- 已读记录最多保留 7 天或 50 条；未读和进行中的请求不受限制。已消费事件处理完即删除，延迟日志最多 200 行。
 - 不保存完整 hook JSON、请求正文、回复正文或 transcript 内容。
 - `~/.codex/hooks.json` 只由用户显式操作安装或撤销；不得覆盖其他 hooks。
 

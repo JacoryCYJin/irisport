@@ -2,7 +2,6 @@ use crate::hooks_config;
 use crate::panel;
 use crate::paths;
 use crate::store::{SessionView, Store};
-use crate::tray;
 use serde::Serialize;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -18,13 +17,13 @@ pub struct HookStatusView {
     rejected_count: usize,
     hooks_path: String,
     hook_installed: bool,
+    data_path: String,
+    version: String,
 }
 
 #[derive(Serialize)]
 pub struct OpenResultView {
     ok: bool,
-    cleared: bool,
-    kept_due_to_new_result: bool,
     message: Option<String>,
 }
 
@@ -34,77 +33,31 @@ pub fn list_sessions(store: State<Store>) -> Result<Vec<SessionView>, String> {
 }
 
 #[tauri::command]
-pub fn open_session(
-    app: AppHandle,
-    store: State<Store>,
-    session_id: String,
-    expected_result_seq: i64,
-) -> Result<OpenResultView, String> {
-    let Some((unread, current_seq)) = store.session_state(&session_id)? else {
-        return Ok(OpenResultView {
-            ok: false,
-            cleared: false,
-            kept_due_to_new_result: false,
-            message: Some("会话不存在".to_string()),
-        });
-    };
-
-    if !unread {
-        return Ok(OpenResultView {
-            ok: true,
-            cleared: false,
-            kept_due_to_new_result: false,
-            message: None,
-        });
-    }
-
-    if current_seq != expected_result_seq {
-        return Ok(OpenResultView {
-            ok: true,
-            cleared: false,
-            kept_due_to_new_result: true,
-            message: Some("已有新结果，本次提醒保留".to_string()),
-        });
-    }
-
+pub fn open_session(session_id: String) -> Result<OpenResultView, String> {
     let url = format!("codex://threads/{}", encode_component(&session_id));
     let result = Command::new("/usr/bin/open").arg(&url).output();
-    let accepted = match &result {
-        Ok(output) => output.status.success(),
-        Err(_) => false,
-    };
 
-    if !accepted {
-        let detail = match result {
-            Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            Err(error) => error.to_string(),
-        };
-        return Ok(OpenResultView {
-            ok: false,
-            cleared: false,
-            kept_due_to_new_result: false,
-            message: Some(if detail.is_empty() {
-                "系统未接受打开请求，提醒已保留".to_string()
-            } else {
-                format!("系统未接受打开请求：{detail}")
-            }),
-        });
-    }
-
-    let cleared = store.clear_if_version(&session_id, expected_result_seq)?;
-    if cleared {
-        if let Ok(count) = store.count_unread() {
-            tray::set_count(&app, count);
+    match result {
+        Ok(output) if output.status.success() => Ok(OpenResultView {
+            ok: true,
+            message: None,
+        }),
+        Ok(output) => {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Ok(OpenResultView {
+                ok: false,
+                message: Some(if detail.is_empty() {
+                    "系统未接受打开请求".to_string()
+                } else {
+                    format!("系统未接受打开请求：{detail}")
+                }),
+            })
         }
-        let _ = app.emit("sessions-updated", ());
+        Err(error) => Ok(OpenResultView {
+            ok: false,
+            message: Some(format!("无法发起打开请求：{error}")),
+        }),
     }
-
-    Ok(OpenResultView {
-        ok: true,
-        cleared,
-        kept_due_to_new_result: false,
-        message: None,
-    })
 }
 
 #[tauri::command]
@@ -134,6 +87,68 @@ pub fn hide_panel(app: AppHandle) {
 }
 
 #[tauri::command]
+pub fn set_panel_height(app: AppHandle, height: f64) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("panel") else {
+        return Ok(());
+    };
+    let height = height.clamp(100.0, 480.0);
+    window
+        .set_size(tauri::LogicalSize::new(360.0, height))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn open_settings(app: AppHandle) -> Result<(), String> {
+    show_settings(&app)
+}
+
+pub fn refresh_hook_binary(app: &AppHandle) -> Result<(), String> {
+    let (configured, _) = hooks_config::configured()?;
+    if !configured {
+        return Ok(());
+    }
+    let source = hook_source(app)?;
+    let destination = paths::hook_binary();
+    fs::create_dir_all(paths::hook_bin_dir()).map_err(|error| error.to_string())?;
+    let temp = paths::hook_bin_dir().join(format!(
+        ".irisport-hook-{}.tmp",
+        std::process::id()
+    ));
+    fs::copy(&source, &temp).map_err(|error| error.to_string())?;
+    fs::set_permissions(&temp, fs::Permissions::from_mode(0o755))
+        .map_err(|error| error.to_string())?;
+    fs::rename(&temp, &destination).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub fn show_settings(app: &AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("settings") {
+        #[cfg(target_os = "macos")]
+        let _ = app.show();
+        let _ = window.show();
+        let _ = window.set_focus();
+        return Ok(());
+    }
+
+    let window = tauri::WebviewWindowBuilder::new(
+        app,
+        "settings",
+        tauri::WebviewUrl::App("index.html?view=settings".into()),
+    )
+    .title("Irisport 设置")
+    .inner_size(560.0, 540.0)
+    .resizable(false)
+    .center()
+    .build()
+    .map_err(|error| error.to_string())?;
+
+    #[cfg(target_os = "macos")]
+    let _ = app.show();
+    let _ = window.set_focus();
+    Ok(())
+}
+
+#[tauri::command]
 pub fn open_codex_settings() -> Result<(), String> {
     Command::new("/usr/bin/open")
         .arg("codex://settings")
@@ -146,19 +161,6 @@ pub fn open_codex_settings() -> Result<(), String> {
             }
         })
         .map_err(|error| error.to_string())?
-}
-
-pub fn install_from_tray(app: &AppHandle) -> Result<(), String> {
-    let store = app.state::<Store>();
-    install_inner(app, &store)?;
-    let _ = app.emit("hook-status-updated", ());
-    Ok(())
-}
-
-pub fn uninstall_from_tray(app: &AppHandle) -> Result<(), String> {
-    hooks_config::uninstall()?;
-    let _ = app.emit("hook-status-updated", ());
-    Ok(())
 }
 
 fn install_inner(app: &AppHandle, store: &Store) -> Result<(), String> {
@@ -196,9 +198,14 @@ fn build_status(_app: &AppHandle, store: &Store) -> Result<HookStatusView, Strin
         configured,
         access_verified,
         last_event_at,
-        rejected_count: count_lines(&paths::rejected_path()),
+        rejected_count: store
+            .meta_get("rejected_count")?
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0),
         hooks_path: hooks_config::hooks_path().display().to_string(),
         hook_installed: paths::hook_binary().is_file(),
+        data_path: paths::support_dir().display().to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
 
@@ -214,12 +221,6 @@ fn hook_source(app: &AppHandle) -> Result<std::path::PathBuf, String> {
         return Ok(candidate);
     }
     Err("找不到 irisport-hook 二进制，请先运行 scripts/prepare-hook.sh".to_string())
-}
-
-fn count_lines(path: &std::path::Path) -> usize {
-    fs::read_to_string(path)
-        .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
-        .unwrap_or(0)
 }
 
 fn encode_component(value: &str) -> String {

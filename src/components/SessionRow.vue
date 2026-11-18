@@ -23,18 +23,6 @@ const timeLabel = computed(() => {
     formatRelative(sessionTime(props.session))
   );
 });
-
-const stateLabel = computed(() => {
-  if (props.session.pending) return "等待结果";
-  if (props.session.unread) return "新结果";
-  return "已查看";
-});
-
-const stateClass = computed(() => {
-  if (props.session.pending) return "pending";
-  if (props.session.unread) return "unread";
-  return "read";
-});
 </script>
 
 <template>
@@ -45,19 +33,27 @@ const stateClass = computed(() => {
     :disabled="busy"
     @click="emit('open', session)"
   >
-    <span class="session-top">
-      <span class="source">
-        <span v-if="session.unread" class="unread-dot"></span>
-        Codex
+    <span class="session-main">
+      <span class="session-top">
+        <span class="source">
+          <span v-if="session.unread" class="unread-dot"></span>
+          Codex
+        </span>
+        <span class="session-meta">
+          <span class="time">{{ timeLabel }}</span>
+        </span>
       </span>
-      <span class="time">{{ timeLabel }}</span>
+      <span class="excerpt">{{ excerpt }}</span>
     </span>
-    <span class="excerpt">{{ excerpt }}</span>
-    <span class="session-bottom">
-      <span class="state" :class="stateClass">{{ stateLabel }}</span>
-      <svg class="chevron" viewBox="0 0 10 10" aria-hidden="true">
-        <path d="M3.5 1.5 7 5l-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
-      </svg>
-    </span>
+    <svg class="chevron" viewBox="0 0 10 10" aria-hidden="true">
+      <path
+        d="M3.5 1.5 7 5l-3.5 3.5"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.4"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+    </svg>
   </button>
 </template>

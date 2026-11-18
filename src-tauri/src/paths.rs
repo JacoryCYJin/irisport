@@ -11,7 +11,7 @@ pub fn support_dir() -> PathBuf {
 }
 
 pub fn ensure_dirs() -> std::io::Result<()> {
-    std::fs::create_dir_all(support_dir().join("events"))?;
+    std::fs::create_dir_all(support_dir().join("events/inbox"))?;
     std::fs::create_dir_all(support_dir().join("logs"))?;
     std::fs::create_dir_all(hook_bin_dir())?;
     Ok(())
@@ -21,12 +21,20 @@ pub fn db_path() -> PathBuf {
     support_dir().join("irisport.sqlite3")
 }
 
-pub fn spool_path() -> PathBuf {
+pub fn inbox_dir() -> PathBuf {
+    support_dir().join("events/inbox")
+}
+
+pub fn legacy_queue_path() -> PathBuf {
     support_dir().join("events/queue.jsonl")
 }
 
-pub fn rejected_path() -> PathBuf {
+pub fn legacy_rejected_path() -> PathBuf {
     support_dir().join("events/rejected.jsonl")
+}
+
+pub fn probe_dir() -> PathBuf {
+    support_dir().join("probe")
 }
 
 pub fn latency_path() -> PathBuf {

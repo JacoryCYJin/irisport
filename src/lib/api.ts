@@ -19,25 +19,25 @@ export interface HookStatus {
   rejected_count: number;
   hooks_path: string;
   hook_installed: boolean;
+  data_path: string;
+  version: string;
 }
 
 export interface OpenResult {
   ok: boolean;
-  cleared: boolean;
-  kept_due_to_new_result: boolean;
   message: string | null;
 }
 
 export const api = {
   listSessions: () => invoke<SessionView[]>("list_sessions"),
-  openSession: (sessionId: string, expectedResultSeq: number) =>
-    invoke<OpenResult>("open_session", {
-      sessionId,
-      expectedResultSeq,
-    }),
+  openSession: (sessionId: string) =>
+    invoke<OpenResult>("open_session", { sessionId }),
   installHooks: () => invoke<HookStatus>("install_codex_hooks"),
   uninstallHooks: () => invoke<HookStatus>("uninstall_codex_hooks"),
   hookStatus: () => invoke<HookStatus>("hook_status"),
   hidePanel: () => invoke<void>("hide_panel"),
+  setPanelHeight: (height: number) =>
+    invoke<void>("set_panel_height", { height }),
+  openSettings: () => invoke<void>("open_settings"),
   openCodexSettings: () => invoke<void>("open_codex_settings"),
 };
