@@ -2,7 +2,6 @@
 import { computed } from "vue";
 import type { SessionView } from "../lib/api";
 import { formatDuration } from "../lib/time";
-import AppIcon from "./AppIcon.vue";
 import SourceIcon from "./SourceIcon.vue";
 
 const props = defineProps<{
@@ -68,6 +67,5 @@ const actionLabel = computed(() =>
       </span>
       <span class="session-title">{{ title }}</span>
     </span>
-    <AppIcon v-if="canOpen" class="chevron" name="chevron-right" />
   </component>
 </template>

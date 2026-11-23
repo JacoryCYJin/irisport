@@ -20,6 +20,30 @@ pub fn uninstall() -> Result<usize, String> {
     uninstall_at(&config_path())
 }
 
+pub fn uses_current_wrapper() -> Result<bool, String> {
+    let expected = crate::paths::hook_wrapper().display().to_string();
+    Ok(value_uses_wrapper(&load(&config_path())?, &expected))
+}
+
+fn value_uses_wrapper(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::Object(object) => object.iter().all(|(key, value)| {
+            if key == "command" {
+                value
+                    .as_str()
+                    .map(|command| !command.contains(MARKER) || command.contains(expected))
+                    .unwrap_or(true)
+            } else {
+                value_uses_wrapper(value, expected)
+            }
+        }),
+        Value::Array(array) => array
+            .iter()
+            .all(|value| value_uses_wrapper(value, expected)),
+        _ => true,
+    }
+}
+
 pub fn expected_entries() -> usize {
     EVENTS.len()
 }
@@ -249,6 +273,17 @@ mod tests {
         assert!(text.contains("echo other"));
         assert!(!text.contains(MARKER));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn irisport_commands_must_use_the_current_wrapper_path() {
+        let root = json!({
+            "hooks": {
+                "Stop": [{"hooks": [{"command": "/old/irisport-hook.sh"}]}]
+            }
+        });
+        assert!(!value_uses_wrapper(&root, "/current/irisport-hook.sh"));
+        assert!(value_uses_wrapper(&root, "/old/irisport-hook.sh"));
     }
 
     #[test]

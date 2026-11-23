@@ -27,6 +27,29 @@ pub fn uninstall() -> Result<usize, String> {
     uninstall_at(&config_path())
 }
 
+pub fn uses_current_wrapper() -> Result<bool, String> {
+    let expected = paths::hook_wrapper().display().to_string();
+    let document = load(&config_path())?;
+    let Some(hooks) = document
+        .as_table()
+        .get("hooks")
+        .and_then(|item| item.as_array_of_tables())
+    else {
+        return Ok(true);
+    };
+    Ok(hooks_use_wrapper(hooks, &expected))
+}
+
+fn hooks_use_wrapper(hooks: &ArrayOfTables, expected: &str) -> bool {
+    hooks.iter().all(|table| {
+        table
+            .get("command")
+            .and_then(|item| item.as_str())
+            .map(|command| !command.contains(MARKER) || command.contains(expected))
+            .unwrap_or(true)
+    })
+}
+
 pub fn expected_entries() -> usize {
     RULES.len()
 }
@@ -242,6 +265,20 @@ mod tests {
         .unwrap();
         assert_eq!(configured_at(&path).unwrap(), (true, BASE_EVENTS.len()));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn irisport_commands_must_use_the_current_wrapper_path() {
+        let document = "[[hooks]]\nevent = \"Stop\"\ncommand = \"/old/irisport-hook.sh\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let hooks = document
+            .as_table()
+            .get("hooks")
+            .and_then(|item| item.as_array_of_tables())
+            .unwrap();
+        assert!(!hooks_use_wrapper(hooks, "/current/irisport-hook.sh"));
+        assert!(hooks_use_wrapper(hooks, "/old/irisport-hook.sh"));
     }
 
     #[test]

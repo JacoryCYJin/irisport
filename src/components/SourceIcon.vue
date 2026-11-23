@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import codexLogo from "../assets/sources/codex.png";
+import chatGptLogo from "../assets/sources/chatgpt.png";
 import kimiCodeLogo from "../assets/sources/kimi-code.png";
 import workBuddyLogo from "../assets/sources/workbuddy.png";
 
@@ -11,7 +11,7 @@ const props = defineProps<{
 const logo = computed(() => {
   if (props.source === "kimi-code") return kimiCodeLogo;
   if (props.source === "workbuddy") return workBuddyLogo;
-  return codexLogo;
+  return chatGptLogo;
 });
 </script>
 
