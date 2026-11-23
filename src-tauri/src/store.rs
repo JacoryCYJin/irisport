@@ -90,8 +90,12 @@ impl Store {
         } else if version == 3 {
             migrate_v4(&mut conn)?;
             migrate_v5(&mut conn)?;
+            migrate_v6(&mut conn)?;
         } else if version == 4 {
             migrate_v5(&mut conn)?;
+            migrate_v6(&mut conn)?;
+        } else if version == 5 {
+            migrate_v6(&mut conn)?;
         } else {
             create_schema(&conn)?;
         }
@@ -107,7 +111,8 @@ impl Store {
     pub fn apply(&self, event: &HookEvent) -> StoreResult<bool> {
         let kind = match event.event.as_str() {
             "UserPromptSubmit" | "TurnStarted" => "prompt",
-            "Stop" | "Notification" => "stop",
+            "Stop" => "stop",
+            "Notification" => "background",
             "StopFailure" | "Interrupt" => "end",
             "PreModelRequest" => "model_start",
             "ModelRequestFailed" => "model_failure",
@@ -154,8 +159,8 @@ impl Store {
                 tx.execute(
                     "INSERT INTO sessions(
                        source, session_id, session_title, prompt_excerpt, cwd, client_type,
-                       last_prompt_at, last_result_at, result_seq, unread, state, updated_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 0, 0, 'running', ?7)
+                       last_prompt_at, last_result_at, result_seq, unread, state, active_turn_id, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 0, 0, 'running', ?8, ?7)
                      ON CONFLICT(source, session_id) DO UPDATE SET
                        session_title = COALESCE(excluded.session_title, sessions.session_title),
                        prompt_excerpt = COALESCE(excluded.prompt_excerpt, sessions.prompt_excerpt),
@@ -163,6 +168,7 @@ impl Store {
                        client_type = COALESCE(excluded.client_type, sessions.client_type),
                        last_prompt_at = excluded.last_prompt_at,
                        state = 'running',
+                       active_turn_id = excluded.active_turn_id,
                        updated_at = excluded.updated_at",
                     params![
                         source,
@@ -171,7 +177,8 @@ impl Store {
                         event.prompt,
                         event.cwd,
                         event.client_type,
-                        event.t
+                        event.t,
+                        event.turn_id
                     ],
                 )
                 .map_err(|error| error.to_string())?;
@@ -180,8 +187,8 @@ impl Store {
                 tx.execute(
                     "INSERT INTO sessions(
                        source, session_id, session_title, prompt_excerpt, cwd, client_type,
-                       last_prompt_at, last_result_at, result_seq, unread, opened_at, state, updated_at
-                     ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, NULL, ?6, 1, 1, NULL, 'completed', ?6)
+                       last_prompt_at, last_result_at, result_seq, unread, opened_at, state, active_turn_id, updated_at
+                     ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, NULL, ?6, 1, 1, NULL, 'completed', ?7, ?6)
                      ON CONFLICT(source, session_id) DO UPDATE SET
                        session_title = COALESCE(excluded.session_title, sessions.session_title),
                        cwd = COALESCE(excluded.cwd, sessions.cwd),
@@ -191,14 +198,20 @@ impl Store {
                        unread = 1,
                        opened_at = NULL,
                        state = 'completed',
-                       updated_at = excluded.updated_at",
+                       active_turn_id = excluded.active_turn_id,
+                       updated_at = excluded.updated_at
+                     WHERE sessions.state = 'running'
+                       AND (sessions.active_turn_id IS NULL
+                            OR sessions.active_turn_id = excluded.active_turn_id
+                            OR sessions.source IN ('kimi-code', 'workbuddy'))",
                     params![
                         source,
                         event.session_id,
                         event.session_title,
                         event.cwd,
                         event.client_type,
-                        event.t
+                        event.t,
+                        event.turn_id
                     ],
                 )
                 .map_err(|error| error.to_string())?;
@@ -218,11 +231,16 @@ impl Store {
                 };
                 tx.execute(
                     "INSERT INTO sessions(
-                       source, session_id, session_title, cwd, client_type, state, updated_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                       source, session_id, session_title, cwd, client_type, state, active_turn_id, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?8, ?7)
                      ON CONFLICT(source, session_id) DO UPDATE SET
                        state = excluded.state,
-                       updated_at = excluded.updated_at",
+                       active_turn_id = excluded.active_turn_id,
+                       updated_at = excluded.updated_at
+                     WHERE sessions.state = 'running'
+                       AND (sessions.active_turn_id IS NULL
+                            OR sessions.active_turn_id = excluded.active_turn_id
+                            OR sessions.source = 'kimi-code')",
                     params![
                         source,
                         event.session_id,
@@ -230,7 +248,8 @@ impl Store {
                         event.cwd,
                         event.client_type,
                         state,
-                        event.t
+                        event.t,
+                        event.turn_id
                     ],
                 )
                 .map_err(|error| error.to_string())?;
@@ -401,19 +420,86 @@ impl Store {
         .map_err(|error| error.to_string())
     }
 
+    pub fn mark_interrupted_session(
+        &self,
+        source: &str,
+        session_id: &str,
+        ended_at: i64,
+    ) -> StoreResult<bool> {
+        let conn = self.lock()?;
+        let updated = conn
+            .execute(
+                "UPDATE sessions SET state = 'interrupted', updated_at = ?1
+                 WHERE source = ?2 AND session_id = ?3 AND state = 'running'
+                   AND COALESCE(last_prompt_at, 0) <= ?1",
+                params![ended_at, sources::canonical(source), session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(updated > 0)
+    }
+
+    pub fn complete_running_session_from_external(
+        &self,
+        source: &str,
+        session_id: &str,
+        ended_at: i64,
+    ) -> StoreResult<Option<SessionView>> {
+        let source = sources::canonical(source).to_string();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let updated = tx
+            .execute(
+                "UPDATE sessions SET
+                   state = 'completed', last_result_at = ?1, result_seq = result_seq + 1,
+                   unread = 1, opened_at = NULL, updated_at = ?1
+                 WHERE source = ?2 AND session_id = ?3 AND state = 'running'
+                   AND COALESCE(last_prompt_at, 0) <= ?1",
+                params![ended_at, source, session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated > 0 {
+            tx.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, '0')",
+                params![external_unread_key(&source, session_id)],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        drop(conn);
+        Ok(self.list_sessions()?.into_iter().find(|session| {
+            session.source == source
+                && session.session_id == session_id
+                && session.state == "completed"
+        }))
+    }
+
     pub fn mark_seen_sessions(&self, sessions: &[(String, String)]) -> StoreResult<usize> {
-        self.mark_seen_sessions_inner(sessions, false)
+        self.mark_seen_sessions_inner(sessions, false, None)
     }
 
     pub fn mark_observed_session(&self, source: &str, session_id: &str) -> StoreResult<bool> {
         let sessions = vec![(source.to_string(), session_id.to_string())];
-        Ok(self.mark_seen_sessions_inner(&sessions, true)? == 1)
+        Ok(self.mark_seen_sessions_inner(&sessions, true, None)? == 1)
+    }
+
+    pub fn mark_observed_session_turn(
+        &self,
+        source: &str,
+        session_id: &str,
+        started_at: i64,
+    ) -> StoreResult<bool> {
+        let sessions = vec![(source.to_string(), session_id.to_string())];
+        Ok(self.mark_seen_sessions_inner(&sessions, true, Some(started_at))? == 1)
     }
 
     fn mark_seen_sessions_inner(
         &self,
         sessions: &[(String, String)],
         require_observed_unread: bool,
+        expected_started_at: Option<i64>,
     ) -> StoreResult<usize> {
         if sessions.is_empty() {
             return Ok(0);
@@ -448,6 +534,20 @@ impl Store {
                     .map_err(|error| error.to_string())?;
                 if ready.is_none() {
                     continue;
+                }
+                if let Some(expected) = expected_started_at {
+                    let matches_turn: Option<i64> = tx
+                        .query_row(
+                            "SELECT 1 FROM sessions
+                             WHERE source = ?1 AND session_id = ?2 AND last_prompt_at = ?3",
+                            params![source, session_id, expected],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(|error| error.to_string())?;
+                    if matches_turn.is_none() {
+                        continue;
+                    }
                 }
             }
             let mut turn_ids = Vec::new();
@@ -811,9 +911,7 @@ fn current_turn_id(
     session_id: &str,
 ) -> StoreResult<Option<String>> {
     tx.query_row(
-        "SELECT turn_id FROM events
-         WHERE source = ?1 AND session_id = ?2 AND kind = 'prompt'
-         ORDER BY processed_at DESC, rowid DESC LIMIT 1",
+        "SELECT active_turn_id FROM sessions WHERE source = ?1 AND session_id = ?2",
         params![source, session_id],
         |row| row.get(0),
     )
@@ -853,6 +951,7 @@ fn create_schema(conn: &Connection) -> StoreResult<()> {
            opened_at INTEGER,
            dismissed_at INTEGER,
            state TEXT NOT NULL DEFAULT 'completed',
+           active_turn_id TEXT,
            activity TEXT,
            updated_at INTEGER NOT NULL,
            PRIMARY KEY(source, session_id)
@@ -879,7 +978,7 @@ fn create_schema(conn: &Connection) -> StoreResult<()> {
            key TEXT PRIMARY KEY,
            value TEXT NOT NULL
          );
-         PRAGMA user_version = 5;",
+         PRAGMA user_version = 6;",
     )
     .map_err(|error| error.to_string())
 }
@@ -942,6 +1041,24 @@ fn migrate_v5(conn: &mut Connection) -> StoreResult<()> {
     tx.execute_batch(
         "ALTER TABLE sessions ADD COLUMN dismissed_at INTEGER;
          PRAGMA user_version = 5;",
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn migrate_v6(conn: &mut Connection) -> StoreResult<()> {
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    tx.execute_batch(
+        "ALTER TABLE sessions ADD COLUMN active_turn_id TEXT;
+         UPDATE sessions SET active_turn_id = (
+           SELECT turn_id FROM events
+           WHERE events.source = sessions.source
+             AND events.session_id = sessions.session_id
+             AND kind = 'prompt'
+           ORDER BY processed_at DESC, rowid DESC LIMIT 1
+         );
+         PRAGMA user_version = 6;",
     )
     .map_err(|error| error.to_string())?;
     tx.commit().map_err(|error| error.to_string())?;
@@ -1144,6 +1261,91 @@ mod tests {
     }
 
     #[test]
+    fn previous_turn_stop_does_not_complete_the_new_turn() {
+        let store = store();
+        store
+            .apply(&event("UserPromptSubmit", "s1", "t1", 100))
+            .unwrap();
+        store
+            .apply(&event("UserPromptSubmit", "s1", "t2", 200))
+            .unwrap();
+        store.apply(&event("Stop", "s1", "t1", 300)).unwrap();
+        assert_eq!(store.list_sessions().unwrap()[0].state, "running");
+        store.apply(&event("Stop", "s1", "t2", 400)).unwrap();
+        assert_eq!(store.list_sessions().unwrap()[0].state, "completed");
+    }
+
+    #[test]
+    fn previous_turn_interrupt_does_not_cancel_the_new_turn() {
+        let store = store();
+        store
+            .apply(&event("UserPromptSubmit", "s1", "t1", 100))
+            .unwrap();
+        store
+            .apply(&event("UserPromptSubmit", "s1", "t2", 200))
+            .unwrap();
+        store.apply(&event("Interrupt", "s1", "t1", 300)).unwrap();
+        assert_eq!(store.list_sessions().unwrap()[0].state, "running");
+    }
+
+    #[test]
+    fn kimi_background_notification_does_not_complete_the_main_turn() {
+        let store = store();
+        store
+            .apply(&source_event("kimi-code", "TurnStarted", "s1", "t1", 100))
+            .unwrap();
+        store
+            .apply(&source_event(
+                "kimi-code",
+                "Notification",
+                "s1",
+                "task-1",
+                200,
+            ))
+            .unwrap();
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions[0].state, "running");
+        assert_eq!(sessions[0].result_seq, 0);
+        assert!(!sessions[0].unread);
+    }
+
+    #[test]
+    fn workbuddy_stop_is_accepted_without_a_source_turn_id() {
+        let store = store();
+        store
+            .apply(&source_event(
+                "workbuddy",
+                "UserPromptSubmit",
+                "s1",
+                "prompt-1",
+                100,
+            ))
+            .unwrap();
+        store
+            .apply(&source_event("workbuddy", "Stop", "s1", "stop-1", 200))
+            .unwrap();
+        assert_eq!(store.list_sessions().unwrap()[0].state, "completed");
+    }
+
+    #[test]
+    fn kimi_stop_is_not_blocked_by_generated_turn_ids() {
+        let store = store();
+        store
+            .apply(&source_event(
+                "kimi-code",
+                "TurnStarted",
+                "s1",
+                "turnstarted-100",
+                100,
+            ))
+            .unwrap();
+        store
+            .apply(&source_event("kimi-code", "Stop", "s1", "stop-200", 200))
+            .unwrap();
+        assert_eq!(store.list_sessions().unwrap()[0].state, "completed");
+    }
+
+    #[test]
     fn seen_session_hides_but_is_retained() {
         let store = store();
         store.apply(&event("Stop", "s1", "t1", 200)).unwrap();
@@ -1318,6 +1520,33 @@ mod tests {
             store.source_meta_get("codex", "last_event_at").unwrap(),
             Some("100".to_string())
         );
+    }
+
+    #[test]
+    fn v5_running_session_gets_its_turn_id_during_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE sessions DROP COLUMN active_turn_id;
+             PRAGMA user_version = 5;
+             INSERT INTO sessions(
+               source, session_id, last_prompt_at, state, updated_at
+             ) VALUES ('codex', 's1', 100, 'running', 100);
+             INSERT INTO events(source, session_id, turn_id, kind, processed_at)
+             VALUES ('codex', 's1', 't1', 'prompt', 100);",
+        )
+        .unwrap();
+        let store = Store::init(conn).unwrap();
+        let active: Option<String> = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT active_turn_id FROM sessions WHERE source = 'codex' AND session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active.as_deref(), Some("t1"));
     }
 
     #[test]

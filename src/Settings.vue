@@ -77,11 +77,6 @@ function connectionTone(source: SourceStatus) {
   return "idle";
 }
 
-function capabilityLabel(source: SourceStatus) {
-  if (!source.supports_completion) return "仅支持打开应用";
-  return source.supports_auto_read ? "任务状态 · 原应用查看后已读" : "任务状态 · 暂不支持已读";
-}
-
 function lastEvent(source: SourceStatus) {
   return source.last_event_at ? formatRelative(source.last_event_at) : "暂无";
 }
@@ -323,7 +318,6 @@ onUnmounted(() => {
               <SourceIcon :source="source.source" />
               <span class="source-copy">
                 <span class="item-title">{{ source.label }}</span>
-                <span class="item-sub">{{ capabilityLabel(source) }}</span>
               </span>
               <span class="source-state" :class="connectionTone(source)">
                 <span class="dot"></span>{{ connectionLabel(source) }}
