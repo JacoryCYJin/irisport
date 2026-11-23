@@ -1,6 +1,6 @@
 use crate::paths;
 use crate::sources;
-use crate::store::{external_unread_key, Store, StoreResult};
+use crate::store::{external_unread_key, SessionView, Store, StoreResult};
 use crate::tray;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::thread;
@@ -11,14 +11,19 @@ pub fn start(app: AppHandle, store: Store) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_millis(500));
 
-        let Ok(unread) = store.unread_sessions() else {
-            continue;
-        };
-        let unread: Vec<(String, String)> = unread
+        let unread = store
+            .unread_sessions()
+            .unwrap_or_default()
             .into_iter()
             .filter(|(source, _)| source == sources::WORKBUDDY)
-            .collect();
-        if unread.is_empty() {
+            .collect::<Vec<_>>();
+        let running = store
+            .list_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|session| session.source == sources::WORKBUDDY && session.pending)
+            .collect::<Vec<_>>();
+        if unread.is_empty() && running.is_empty() {
             continue;
         }
 
@@ -35,6 +40,24 @@ pub fn start(app: AppHandle, store: Store) {
         let _ = conn.busy_timeout(Duration::from_millis(200));
 
         let mut changed = false;
+        for session in running {
+            let state = conn
+                .query_row(
+                    "SELECT status, last_activity_at FROM sessions WHERE id = ?1",
+                    params![session.session_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional();
+            if let Ok(Some((status, last_activity_at))) = state {
+                if let Ok(Some(completed)) =
+                    apply_external_lifecycle(&store, &session.session_id, &status, last_activity_at)
+                {
+                    changed = true;
+                    let _ = app.emit("task-completed", &completed);
+                }
+            }
+        }
+
         for (_, session_id) in unread {
             let state = conn
                 .query_row(
@@ -58,6 +81,22 @@ pub fn start(app: AppHandle, store: Store) {
             let _ = app.emit("sessions-updated", ());
         }
     });
+}
+
+fn apply_external_lifecycle(
+    store: &Store,
+    session_id: &str,
+    status: &str,
+    last_activity_at: i64,
+) -> StoreResult<Option<SessionView>> {
+    if status == "completed" {
+        return store.complete_running_session_from_external(
+            sources::WORKBUDDY,
+            session_id,
+            last_activity_at,
+        );
+    }
+    Ok(None)
 }
 
 fn apply_external_unread(
@@ -101,6 +140,54 @@ mod tests {
             cwd: None,
             client_type: None,
         }
+    }
+
+    fn start(session_id: &str, turn_id: &str, t: i64) -> HookEvent {
+        HookEvent {
+            event: "UserPromptSubmit".to_string(),
+            prompt: Some("WorkBuddy 任务".to_string()),
+            ..stop(session_id, turn_id, t)
+        }
+    }
+
+    #[test]
+    fn external_completed_state_finishes_a_running_task_once() {
+        let (store, path) = store("external-completed");
+        store.apply(&start("s1", "t1", 100)).unwrap();
+        let completed = apply_external_lifecycle(&store, "s1", "completed", 500)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.state, "completed");
+        assert_eq!(completed.result_seq, 1);
+        assert_eq!(completed.last_result_at, Some(500));
+        assert!(apply_external_lifecycle(&store, "s1", "completed", 500)
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn active_or_working_state_keeps_the_task_running() {
+        let (store, path) = store("external-working");
+        store.apply(&start("s1", "t1", 100)).unwrap();
+        for status in ["active", "working"] {
+            assert!(apply_external_lifecycle(&store, "s1", status, 500)
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(store.list_sessions().unwrap()[0].state, "running");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_external_completion_does_not_finish_a_newer_turn() {
+        let (store, path) = store("external-stale");
+        store.apply(&start("s1", "t1", 500)).unwrap();
+        assert!(apply_external_lifecycle(&store, "s1", "completed", 100)
+            .unwrap()
+            .is_none());
+        assert_eq!(store.list_sessions().unwrap()[0].state, "running");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

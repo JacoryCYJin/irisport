@@ -175,23 +175,13 @@ button:disabled {
   justify-content: center;
   flex: 0 0 auto;
   border-radius: 8px;
-  color: #45454b;
-  background: rgba(0, 0, 0, 0.065);
 }
 
-.source-icon .app-icon {
-  width: 18px;
-  height: 18px;
-}
-
-.source-icon.source-kimi-code {
-  color: #0878d1;
-  background: rgba(0, 122, 255, 0.11);
-}
-
-.source-icon.source-workbuddy {
-  color: #0f8f83;
-  background: rgba(20, 184, 166, 0.11);
+.source-icon img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
 }
 
 .session-main {
