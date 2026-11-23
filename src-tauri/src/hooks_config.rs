@@ -5,7 +5,14 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MARKER: &str = "irisport-hook.sh";
-const EVENTS: [&str; 2] = ["UserPromptSubmit", "Stop"];
+const BASE_EVENTS: [&str; 2] = ["UserPromptSubmit", "Stop"];
+const EVENTS: [&str; 5] = [
+    "UserPromptSubmit",
+    "Stop",
+    "Interrupt",
+    "PreModelRequest",
+    "PostModelRequest",
+];
 
 pub fn hooks_path() -> PathBuf {
     if let Some(home) = std::env::var_os("CODEX_HOME") {
@@ -30,10 +37,7 @@ pub fn install(command: &str) -> Result<(), String> {
 
     let mut root = load()?;
     if exists {
-        let backup = path.with_file_name(format!(
-            "hooks.json.irisport-backup-{}",
-            now_secs()
-        ));
+        let backup = path.with_file_name(format!("hooks.json.irisport-backup-{}", now_secs()));
         fs::copy(&path, &backup).map_err(|error| format!("备份 hooks.json 失败: {error}"))?;
     }
 
@@ -101,7 +105,9 @@ pub fn uninstall() -> Result<usize, String> {
         };
         let mut kept_groups = Vec::new();
         for mut group in groups {
-            let Some(handlers) = group.get_mut("hooks").and_then(|value| value.as_array_mut())
+            let Some(handlers) = group
+                .get_mut("hooks")
+                .and_then(|value| value.as_array_mut())
             else {
                 kept_groups.push(group);
                 continue;
@@ -133,18 +139,30 @@ pub fn uninstall() -> Result<usize, String> {
     Ok(removed)
 }
 
+pub fn expected_entries() -> usize {
+    EVENTS.len()
+}
+
 pub fn configured() -> Result<(bool, usize), String> {
-    let root = load()?;
+    configuration_state(&load()?)
+}
+
+fn configuration_state(root: &Value) -> Result<(bool, usize), String> {
     let Some(hooks) = root.get("hooks").and_then(|value| value.as_object()) else {
         return Ok((false, 0));
     };
     let mut entries = 0;
+    let mut base_entries = 0;
     for event in EVENTS {
         if let Some(groups) = hooks.get(event).and_then(|value| value.as_array()) {
-            entries += count_marker(groups);
+            let count = count_marker(groups);
+            entries += count;
+            if BASE_EVENTS.contains(&event) && count > 0 {
+                base_entries += 1;
+            }
         }
     }
-    Ok((entries >= 2, entries))
+    Ok((base_entries == BASE_EVENTS.len(), entries))
 }
 
 fn load() -> Result<Value, String> {
@@ -202,4 +220,31 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_rules_are_connected_without_optional_interrupt() {
+        let root = json!({
+            "hooks": {
+                "UserPromptSubmit": [{"hooks": [{"command": "/tmp/irisport-hook.sh"}]}],
+                "Stop": [{"hooks": [{"command": "/tmp/irisport-hook.sh"}]}]
+            }
+        });
+        assert_eq!(configuration_state(&root).unwrap(), (true, 2));
+    }
+
+    #[test]
+    fn optional_interrupt_does_not_replace_a_base_rule() {
+        let root = json!({
+            "hooks": {
+                "Stop": [{"hooks": [{"command": "/tmp/irisport-hook.sh"}]}],
+                "Interrupt": [{"hooks": [{"command": "/tmp/irisport-hook.sh"}]}]
+            }
+        });
+        assert_eq!(configuration_state(&root).unwrap(), (false, 2));
+    }
 }

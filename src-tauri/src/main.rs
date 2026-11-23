@@ -4,12 +4,16 @@ mod codex;
 mod codex_state;
 mod commands;
 mod hooks_config;
+mod kimi_code;
+mod kimi_code_state;
 mod migration;
 mod panel;
 mod paths;
 mod sources;
 mod store;
 mod tray;
+mod workbuddy;
+mod workbuddy_state;
 
 use store::Store;
 use tauri::Manager;
@@ -19,6 +23,8 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             panel::toggle(app, None);
         }))
+        .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             setup(app).map_err(|error| {
                 Box::new(std::io::Error::other(error)) as Box<dyn std::error::Error>
@@ -27,20 +33,24 @@ fn main() {
         .on_window_event(|window, event| {
             if window.label() == "panel" {
                 if let tauri::WindowEvent::Focused(false) = event {
-                    let _ = window.hide();
+                    panel::hide(window.app_handle());
                 }
             }
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_sessions,
             commands::open_session,
-            commands::install_codex_hooks,
-            commands::uninstall_codex_hooks,
-            commands::hook_status,
+            commands::install_source,
+            commands::uninstall_source,
+            commands::app_status,
+            commands::preferences,
+            commands::set_preference,
             commands::hide_panel,
+            commands::show_panel,
             commands::set_panel_height,
             commands::open_settings,
-            commands::open_codex_settings
+            commands::open_source,
+            commands::reveal_path
         ])
         .run(tauri::generate_context!())
         .expect("无法启动 Irisport");
@@ -68,19 +78,16 @@ fn setup(app: &mut tauri::App) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
             use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
-            let _ = apply_vibrancy(
-                &window,
-                NSVisualEffectMaterial::Popover,
-                None,
-                Some(14.0),
-            );
+            let _ = apply_vibrancy(&window, NSVisualEffectMaterial::Menu, None, Some(14.0));
         }
     }
 
     app.manage(store.clone());
     tray::create(app.handle(), count).map_err(|error| error.to_string())?;
     codex::start(app.handle().clone(), store.clone());
-    codex_state::start(app.handle().clone(), store);
+    codex_state::start(app.handle().clone(), store.clone());
+    workbuddy_state::start(app.handle().clone(), store.clone());
+    kimi_code_state::start(app.handle().clone(), store);
 
     Ok(())
 }

@@ -12,6 +12,14 @@ const SEEN_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const SEEN_LIMIT: i64 = 50;
 const HANDLED_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const HANDLED_LIMIT: i64 = 500;
+const MODEL_FAILURE_GRACE_MS: i64 = 5_000;
+const MODEL_FAILURE_PREFIX: &str = "model_failure_pending:codex:";
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingModelFailure {
+    turn_id: String,
+    failed_at: i64,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HookEvent {
@@ -23,6 +31,12 @@ pub struct HookEvent {
     pub source: String,
     #[serde(default)]
     pub prompt: Option<String>,
+    #[serde(default)]
+    pub session_title: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub client_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -30,13 +44,21 @@ pub struct SessionView {
     pub session_id: String,
     pub source: String,
     pub source_label: String,
+    pub session_title: Option<String>,
     pub prompt_excerpt: Option<String>,
     pub last_prompt_at: Option<i64>,
     pub last_result_at: Option<i64>,
     pub result_seq: i64,
     pub unread: bool,
     pub pending: bool,
+    pub state: String,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionIdentity {
+    pub source: String,
+    pub session_id: String,
 }
 
 #[derive(Clone)]
@@ -53,71 +75,55 @@ impl Store {
         Self::init(conn)
     }
 
-    fn init(conn: Connection) -> StoreResult<Self> {
+    fn init(mut conn: Connection) -> StoreResult<Self> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA foreign_keys = ON;
-             CREATE TABLE IF NOT EXISTS sessions (
-               session_id TEXT PRIMARY KEY,
-               source TEXT NOT NULL,
-               prompt_excerpt TEXT,
-               last_prompt_at INTEGER,
-               last_result_at INTEGER,
-               result_seq INTEGER NOT NULL DEFAULT 0,
-               unread INTEGER NOT NULL DEFAULT 0,
-               opened_at INTEGER,
-               updated_at INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS events (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               session_id TEXT NOT NULL,
-               turn_id TEXT NOT NULL,
-               kind TEXT NOT NULL,
-               processed_at INTEGER NOT NULL,
-               UNIQUE(session_id, turn_id, kind)
-             );
-             CREATE TABLE IF NOT EXISTS handled_turns (
-               session_id TEXT NOT NULL,
-               turn_id TEXT NOT NULL,
-               handled_at INTEGER NOT NULL,
-               PRIMARY KEY(session_id, turn_id)
-             );
-             CREATE INDEX IF NOT EXISTS idx_handled_turns_at
-               ON handled_turns(handled_at);
-             CREATE TABLE IF NOT EXISTS meta (
-               key TEXT PRIMARY KEY,
-               value TEXT NOT NULL
-             );
-             PRAGMA user_version = 2;",
+             PRAGMA foreign_keys = ON;",
         )
         .map_err(|error| error.to_string())?;
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if version < 3 && table_exists(&conn, "sessions")? {
+            migrate_v3(&mut conn)?;
+        } else if version == 3 {
+            migrate_v4(&mut conn)?;
+            migrate_v5(&mut conn)?;
+        } else if version == 4 {
+            migrate_v5(&mut conn)?;
+        } else {
+            create_schema(&conn)?;
+        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
     }
 
     fn lock(&self) -> StoreResult<MutexGuard<'_, Connection>> {
-        self.conn
-            .lock()
-            .map_err(|_| "数据库锁不可用".to_string())
+        self.conn.lock().map_err(|_| "数据库锁不可用".to_string())
     }
 
     pub fn apply(&self, event: &HookEvent) -> StoreResult<bool> {
         let kind = match event.event.as_str() {
-            "UserPromptSubmit" => "prompt",
-            "Stop" => "stop",
+            "UserPromptSubmit" | "TurnStarted" => "prompt",
+            "Stop" | "Notification" => "stop",
+            "StopFailure" | "Interrupt" => "end",
+            "PreModelRequest" => "model_start",
+            "ModelRequestFailed" => "model_failure",
             _ => return Ok(false),
         };
+        let source = sources::canonical(&event.source).to_string();
 
         let mut conn = self.lock()?;
         let tx = conn.transaction().map_err(|error| error.to_string())?;
 
-        if kind == "stop" {
+        if matches!(kind, "stop" | "end") {
             let handled: Option<i64> = tx
                 .query_row(
-                    "SELECT 1 FROM handled_turns WHERE session_id = ?1 AND turn_id = ?2",
-                    params![event.session_id, event.turn_id],
+                    "SELECT 1 FROM handled_turns
+                     WHERE source = ?1 AND session_id = ?2 AND turn_id = ?3",
+                    params![source, event.session_id, event.turn_id],
                     |row| row.get(0),
                 )
                 .optional()
@@ -128,80 +134,182 @@ impl Store {
             }
         }
 
-        let inserted = tx
-            .execute(
-                "INSERT OR IGNORE INTO events(session_id, turn_id, kind, processed_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![event.session_id, event.turn_id, kind, now_ms()],
-            )
-            .map_err(|error| error.to_string())?;
+        if !matches!(kind, "model_start" | "model_failure") {
+            let inserted = tx
+                .execute(
+                    "INSERT OR IGNORE INTO events(source, session_id, turn_id, kind, processed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![source, event.session_id, event.turn_id, kind, now_ms()],
+                )
+                .map_err(|error| error.to_string())?;
 
-        if inserted == 0 {
-            tx.commit().map_err(|error| error.to_string())?;
-            return Ok(false);
+            if inserted == 0 {
+                tx.commit().map_err(|error| error.to_string())?;
+                return Ok(false);
+            }
         }
-
-        let source = if event.source.is_empty() {
-            "unknown"
-        } else {
-            &event.source
-        };
 
         match kind {
             "prompt" => {
-                let prompt = event.prompt.clone().unwrap_or_default();
                 tx.execute(
                     "INSERT INTO sessions(
-                       session_id, source, prompt_excerpt, last_prompt_at,
-                       last_result_at, result_seq, unread, updated_at
-                     ) VALUES (?1, ?2, ?3, ?4, NULL, 0, 0, ?4)
-                     ON CONFLICT(session_id) DO UPDATE SET
-                       source = excluded.source,
-                       prompt_excerpt = excluded.prompt_excerpt,
+                       source, session_id, session_title, prompt_excerpt, cwd, client_type,
+                       last_prompt_at, last_result_at, result_seq, unread, state, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 0, 0, 'running', ?7)
+                     ON CONFLICT(source, session_id) DO UPDATE SET
+                       session_title = COALESCE(excluded.session_title, sessions.session_title),
+                       prompt_excerpt = COALESCE(excluded.prompt_excerpt, sessions.prompt_excerpt),
+                       cwd = COALESCE(excluded.cwd, sessions.cwd),
+                       client_type = COALESCE(excluded.client_type, sessions.client_type),
                        last_prompt_at = excluded.last_prompt_at,
+                       state = 'running',
                        updated_at = excluded.updated_at",
-                    params![event.session_id, source, prompt, event.t],
+                    params![
+                        source,
+                        event.session_id,
+                        event.session_title,
+                        event.prompt,
+                        event.cwd,
+                        event.client_type,
+                        event.t
+                    ],
                 )
                 .map_err(|error| error.to_string())?;
             }
             "stop" => {
                 tx.execute(
                     "INSERT INTO sessions(
-                       session_id, source, prompt_excerpt, last_prompt_at,
-                       last_result_at, result_seq, unread, opened_at, updated_at
-                     ) VALUES (?1, ?2, NULL, NULL, ?3, 1, 1, NULL, ?3)
-                     ON CONFLICT(session_id) DO UPDATE SET
-                       source = excluded.source,
+                       source, session_id, session_title, prompt_excerpt, cwd, client_type,
+                       last_prompt_at, last_result_at, result_seq, unread, opened_at, state, updated_at
+                     ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, NULL, ?6, 1, 1, NULL, 'completed', ?6)
+                     ON CONFLICT(source, session_id) DO UPDATE SET
+                       session_title = COALESCE(excluded.session_title, sessions.session_title),
+                       cwd = COALESCE(excluded.cwd, sessions.cwd),
+                       client_type = COALESCE(excluded.client_type, sessions.client_type),
                        last_result_at = excluded.last_result_at,
                        result_seq = sessions.result_seq + 1,
                        unread = 1,
                        opened_at = NULL,
+                       state = 'completed',
                        updated_at = excluded.updated_at",
-                    params![event.session_id, source, event.t],
+                    params![
+                        source,
+                        event.session_id,
+                        event.session_title,
+                        event.cwd,
+                        event.client_type,
+                        event.t
+                    ],
                 )
                 .map_err(|error| error.to_string())?;
+                if matches!(source.as_str(), sources::WORKBUDDY | sources::KIMI_CODE) {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, '0')",
+                        params![external_unread_key(&source, &event.session_id)],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+            }
+            "end" => {
+                let state = if event.event == "Interrupt" {
+                    "interrupted"
+                } else {
+                    "failed"
+                };
+                tx.execute(
+                    "INSERT INTO sessions(
+                       source, session_id, session_title, cwd, client_type, state, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(source, session_id) DO UPDATE SET
+                       state = excluded.state,
+                       updated_at = excluded.updated_at",
+                    params![
+                        source,
+                        event.session_id,
+                        event.session_title,
+                        event.cwd,
+                        event.client_type,
+                        state,
+                        event.t
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            "model_start" => {
+                if current_turn_id(&tx, &source, &event.session_id)? == Some(event.turn_id.clone())
+                {
+                    tx.execute(
+                        "DELETE FROM meta WHERE key = ?1",
+                        params![model_failure_key(&source, &event.session_id)],
+                    )
+                    .map_err(|error| error.to_string())?;
+                    tx.execute(
+                        "UPDATE sessions SET state = 'running', updated_at = ?1
+                         WHERE source = ?2 AND session_id = ?3
+                           AND state IN ('running', 'failed')",
+                        params![event.t, source, event.session_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+            }
+            "model_failure" => {
+                let running: Option<i64> = tx
+                    .query_row(
+                        "SELECT 1 FROM sessions
+                         WHERE source = ?1 AND session_id = ?2 AND state = 'running'",
+                        params![source, event.session_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                if running.is_some()
+                    && current_turn_id(&tx, &source, &event.session_id)?
+                        == Some(event.turn_id.clone())
+                {
+                    let pending = PendingModelFailure {
+                        turn_id: event.turn_id.clone(),
+                        failed_at: event.t,
+                    };
+                    tx.execute(
+                        "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)",
+                        params![
+                            model_failure_key(&source, &event.session_id),
+                            serde_json::to_string(&pending).map_err(|error| error.to_string())?
+                        ],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
             }
             _ => {}
         }
 
+        if matches!(kind, "prompt" | "stop" | "end") {
+            tx.execute(
+                "DELETE FROM meta WHERE key = ?1",
+                params![model_failure_key(&source, &event.session_id)],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+
         tx.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_event_at', ?1)",
-            params![event.t.to_string()],
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)",
+            params![format!("last_event_at:{source}"), event.t.to_string()],
         )
         .map_err(|error| error.to_string())?;
 
+        let verified_key = format!("access_verified_at:{source}");
         let verified: Option<String> = tx
             .query_row(
-                "SELECT value FROM meta WHERE key = 'access_verified_at'",
-                [],
+                "SELECT value FROM meta WHERE key = ?1",
+                params![verified_key],
                 |row| row.get(0),
             )
             .optional()
             .map_err(|error| error.to_string())?;
         if verified.is_none() {
             tx.execute(
-                "INSERT INTO meta(key, value) VALUES ('access_verified_at', ?1)",
-                params![now_ms().to_string()],
+                "INSERT INTO meta(key, value) VALUES (?1, ?2)",
+                params![verified_key, now_ms().to_string()],
             )
             .map_err(|error| error.to_string())?;
         }
@@ -214,31 +322,34 @@ impl Store {
         let conn = self.lock()?;
         let mut statement = conn
             .prepare(
-                "SELECT session_id, source, prompt_excerpt, last_prompt_at,
-                        last_result_at, result_seq, unread, updated_at
+                "SELECT source, session_id, session_title, prompt_excerpt, last_prompt_at,
+                        last_result_at, result_seq, unread, state, updated_at
                  FROM sessions
-                 WHERE unread = 1
-                 ORDER BY COALESCE(last_result_at, updated_at) DESC",
+                 WHERE state = 'running' OR (unread = 1 AND state != 'running')
+                 ORDER BY updated_at DESC",
             )
             .map_err(|error| error.to_string())?;
 
         let rows = statement
             .query_map([], |row| {
-                let last_prompt_at: Option<i64> = row.get(3)?;
-                let last_result_at: Option<i64> = row.get(4)?;
-                let source: String = row.get(1)?;
+                let last_prompt_at: Option<i64> = row.get(4)?;
+                let last_result_at: Option<i64> = row.get(5)?;
+                let state: String = row.get(8)?;
+                let source: String = row.get(0)?;
                 let source_label = sources::label(&source).to_string();
                 Ok(SessionView {
-                    session_id: row.get(0)?,
-                    source,
+                    source: source.clone(),
+                    session_id: row.get(1)?,
                     source_label,
-                    prompt_excerpt: row.get(2)?,
+                    session_title: row.get(2)?,
+                    prompt_excerpt: row.get(3)?,
                     last_prompt_at,
                     last_result_at,
-                    result_seq: row.get(5)?,
-                    unread: row.get::<_, i64>(6)? != 0,
-                    pending: last_prompt_at.unwrap_or(0) > last_result_at.unwrap_or(0),
-                    updated_at: row.get(7)?,
+                    result_seq: row.get(6)?,
+                    unread: row.get::<_, i64>(7)? != 0,
+                    pending: state == "running",
+                    state,
+                    updated_at: row.get(9)?,
                 })
             })
             .map_err(|error| error.to_string())?;
@@ -260,7 +371,7 @@ impl Store {
     pub fn unread_sessions(&self) -> StoreResult<Vec<(String, String)>> {
         let conn = self.lock()?;
         let mut statement = conn
-            .prepare("SELECT session_id, source FROM sessions WHERE unread = 1")
+            .prepare("SELECT source, session_id FROM sessions WHERE unread = 1")
             .map_err(|error| error.to_string())?;
         let rows = statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -269,36 +380,86 @@ impl Store {
             .map_err(|error| error.to_string())
     }
 
-    pub fn session_source(&self, session_id: &str) -> StoreResult<Option<String>> {
+    pub fn session_identity(
+        &self,
+        source: &str,
+        session_id: &str,
+    ) -> StoreResult<Option<SessionIdentity>> {
+        let source = sources::canonical(source);
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT source FROM sessions WHERE session_id = ?1",
-            params![session_id],
-            |row| row.get(0),
+            "SELECT 1 FROM sessions WHERE source = ?1 AND session_id = ?2",
+            params![source, session_id],
+            |_| {
+                Ok(SessionIdentity {
+                    source: source.to_string(),
+                    session_id: session_id.to_string(),
+                })
+            },
         )
         .optional()
         .map_err(|error| error.to_string())
     }
 
-    pub fn mark_seen_sessions(&self, session_ids: &[String]) -> StoreResult<usize> {
-        if session_ids.is_empty() {
+    pub fn mark_seen_sessions(&self, sessions: &[(String, String)]) -> StoreResult<usize> {
+        self.mark_seen_sessions_inner(sessions, false)
+    }
+
+    pub fn mark_observed_session(&self, source: &str, session_id: &str) -> StoreResult<bool> {
+        let sessions = vec![(source.to_string(), session_id.to_string())];
+        Ok(self.mark_seen_sessions_inner(&sessions, true)? == 1)
+    }
+
+    fn mark_seen_sessions_inner(
+        &self,
+        sessions: &[(String, String)],
+        require_observed_unread: bool,
+    ) -> StoreResult<usize> {
+        if sessions.is_empty() {
             return Ok(0);
         }
         let mut conn = self.lock()?;
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         let now = now_ms();
         let mut updated = 0;
-        for session_id in session_ids {
+        for (source, session_id) in sessions {
+            let source = sources::canonical(source);
+            if require_observed_unread {
+                let observed: Option<String> = tx
+                    .query_row(
+                        "SELECT value FROM meta WHERE key = ?1",
+                        params![external_unread_key(source, session_id)],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                if observed.as_deref() != Some("1") {
+                    continue;
+                }
+                let ready: Option<i64> = tx
+                    .query_row(
+                        "SELECT 1 FROM sessions
+                         WHERE source = ?1 AND session_id = ?2
+                           AND unread = 1 AND state != 'running'",
+                        params![source, session_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                if ready.is_none() {
+                    continue;
+                }
+            }
             let mut turn_ids = Vec::new();
             {
                 let mut statement = tx
                     .prepare(
                         "SELECT turn_id FROM events
-                         WHERE session_id = ?1 AND kind = 'stop'",
+                         WHERE source = ?1 AND session_id = ?2 AND kind = 'stop'",
                     )
                     .map_err(|error| error.to_string())?;
                 let rows = statement
-                    .query_map(params![session_id], |row| row.get::<_, String>(0))
+                    .query_map(params![source, session_id], |row| row.get::<_, String>(0))
                     .map_err(|error| error.to_string())?;
                 for row in rows {
                     turn_ids.push(row.map_err(|error| error.to_string())?);
@@ -306,27 +467,97 @@ impl Store {
             }
             for turn_id in turn_ids {
                 tx.execute(
-                    "INSERT OR IGNORE INTO handled_turns(session_id, turn_id, handled_at)
-                     VALUES (?1, ?2, ?3)",
-                    params![session_id, turn_id, now],
+                    "INSERT OR IGNORE INTO handled_turns(source, session_id, turn_id, handled_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![source, session_id, turn_id, now],
                 )
                 .map_err(|error| error.to_string())?;
             }
             tx.execute(
-                "DELETE FROM events WHERE session_id = ?1",
-                params![session_id],
+                "DELETE FROM events WHERE source = ?1 AND session_id = ?2",
+                params![source, session_id],
             )
             .map_err(|error| error.to_string())?;
-            updated += tx
+            let changed = tx
                 .execute(
                     "UPDATE sessions SET unread = 0, opened_at = ?1
-                     WHERE session_id = ?2 AND unread = 1",
-                    params![now, session_id],
+                     WHERE source = ?2 AND session_id = ?3
+                       AND unread = 1 AND state != 'running'",
+                    params![now, source, session_id],
                 )
                 .map_err(|error| error.to_string())?;
+            if require_observed_unread && changed > 0 {
+                tx.execute(
+                    "DELETE FROM meta WHERE key = ?1",
+                    params![external_unread_key(source, session_id)],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            updated += changed;
         }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(updated)
+    }
+
+    pub fn finalize_model_failures(&self, now: i64) -> StoreResult<usize> {
+        let candidates = {
+            let conn = self.lock()?;
+            let mut statement = conn
+                .prepare("SELECT key, value FROM meta WHERE key LIKE ?1")
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map(params![format!("{MODEL_FAILURE_PREFIX}%")], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+
+        let mut finalized = 0;
+        for (key, raw) in candidates {
+            let Ok(pending) = serde_json::from_str::<PendingModelFailure>(&raw) else {
+                continue;
+            };
+            if now - pending.failed_at < MODEL_FAILURE_GRACE_MS {
+                continue;
+            }
+            let Some(session_id) = key.strip_prefix(MODEL_FAILURE_PREFIX) else {
+                continue;
+            };
+
+            let mut conn = self.lock()?;
+            let tx = conn.transaction().map_err(|error| error.to_string())?;
+            let current: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if current.as_deref() != Some(raw.as_str())
+                || current_turn_id(&tx, sources::CODEX, session_id)?
+                    != Some(pending.turn_id.clone())
+            {
+                tx.commit().map_err(|error| error.to_string())?;
+                continue;
+            }
+            let updated = tx
+                .execute(
+                    "UPDATE sessions SET state = 'failed', updated_at = ?1
+                     WHERE source = ?2 AND session_id = ?3 AND state = 'running'",
+                    params![pending.failed_at, sources::CODEX, session_id],
+                )
+                .map_err(|error| error.to_string())?;
+            if updated > 0 {
+                tx.execute("DELETE FROM meta WHERE key = ?1", params![key])
+                    .map_err(|error| error.to_string())?;
+                finalized += 1;
+            }
+            tx.commit().map_err(|error| error.to_string())?;
+        }
+        Ok(finalized)
     }
 
     pub fn prune_seen(&self) -> StoreResult<usize> {
@@ -338,7 +569,7 @@ impl Store {
         {
             let mut statement = tx
                 .prepare(
-                    "SELECT session_id FROM sessions
+                    "SELECT source, session_id FROM sessions
                      WHERE unread = 0
                        AND last_result_at IS NOT NULL
                        AND COALESCE(last_prompt_at, 0) <= COALESCE(last_result_at, 0)
@@ -346,7 +577,9 @@ impl Store {
                 )
                 .map_err(|error| error.to_string())?;
             let rows = statement
-                .query_map(params![cutoff], |row| row.get::<_, String>(0))
+                .query_map(params![cutoff], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
                 .map_err(|error| error.to_string())?;
             for row in rows {
                 ids.insert(row.map_err(|error| error.to_string())?);
@@ -356,7 +589,7 @@ impl Store {
         {
             let mut statement = tx
                 .prepare(
-                    "SELECT session_id FROM sessions
+                    "SELECT source, session_id FROM sessions
                      WHERE unread = 0
                        AND last_result_at IS NOT NULL
                        AND COALESCE(last_prompt_at, 0) <= COALESCE(last_result_at, 0)
@@ -365,22 +598,24 @@ impl Store {
                 )
                 .map_err(|error| error.to_string())?;
             let rows = statement
-                .query_map(params![SEEN_LIMIT], |row| row.get::<_, String>(0))
+                .query_map(params![SEEN_LIMIT], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
                 .map_err(|error| error.to_string())?;
             for row in rows {
                 ids.insert(row.map_err(|error| error.to_string())?);
             }
         }
 
-        for session_id in &ids {
+        for (source, session_id) in &ids {
             tx.execute(
-                "DELETE FROM events WHERE session_id = ?1",
-                params![session_id],
+                "DELETE FROM events WHERE source = ?1 AND session_id = ?2",
+                params![source, session_id],
             )
             .map_err(|error| error.to_string())?;
             tx.execute(
-                "DELETE FROM sessions WHERE session_id = ?1",
-                params![session_id],
+                "DELETE FROM sessions WHERE source = ?1 AND session_id = ?2",
+                params![source, session_id],
             )
             .map_err(|error| error.to_string())?;
         }
@@ -429,31 +664,32 @@ impl Store {
         {
             let mut statement = tx
                 .prepare(
-                    "SELECT session_id FROM sessions
-                     WHERE unread = 0
-                       AND last_result_at IS NOT NULL
+                    "SELECT source, session_id FROM sessions
+                     WHERE unread = 0 AND last_result_at IS NOT NULL
                        AND COALESCE(last_prompt_at, 0) <= COALESCE(last_result_at, 0)",
                 )
                 .map_err(|error| error.to_string())?;
             let rows = statement
-                .query_map([], |row| row.get::<_, String>(0))
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
                 .map_err(|error| error.to_string())?;
             for row in rows {
                 seen_ids.push(row.map_err(|error| error.to_string())?);
             }
         }
 
-        for session_id in seen_ids {
+        for (source, session_id) in seen_ids {
             let mut turn_ids = Vec::new();
             {
                 let mut statement = tx
                     .prepare(
                         "SELECT turn_id FROM events
-                         WHERE session_id = ?1 AND kind = 'stop'",
+                         WHERE source = ?1 AND session_id = ?2 AND kind = 'stop'",
                     )
                     .map_err(|error| error.to_string())?;
                 let rows = statement
-                    .query_map(params![session_id], |row| row.get::<_, String>(0))
+                    .query_map(params![source, session_id], |row| row.get::<_, String>(0))
                     .map_err(|error| error.to_string())?;
                 for row in rows {
                     turn_ids.push(row.map_err(|error| error.to_string())?);
@@ -461,15 +697,15 @@ impl Store {
             }
             for turn_id in turn_ids {
                 tx.execute(
-                    "INSERT OR IGNORE INTO handled_turns(session_id, turn_id, handled_at)
-                     VALUES (?1, ?2, ?3)",
-                    params![session_id, turn_id, now],
+                    "INSERT OR IGNORE INTO handled_turns(source, session_id, turn_id, handled_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![source, session_id, turn_id, now],
                 )
                 .map_err(|error| error.to_string())?;
             }
             tx.execute(
-                "DELETE FROM events WHERE session_id = ?1",
-                params![session_id],
+                "DELETE FROM events WHERE source = ?1 AND session_id = ?2",
+                params![source, session_id],
             )
             .map_err(|error| error.to_string())?;
         }
@@ -489,21 +725,33 @@ impl Store {
         self.meta_set("storage_version", &version.to_string())
     }
 
-    pub fn increment_rejected(&self) -> StoreResult<()> {
+    pub fn increment_rejected(&self, source: &str) -> StoreResult<()> {
+        let source = sources::canonical(source);
+        let key = format!("rejected_count:{source}");
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO meta(key, value) VALUES ('rejected_count', '1')
+            "INSERT INTO meta(key, value) VALUES (?1, '1')
              ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
-            [],
+            params![key],
         )
         .map_err(|error| error.to_string())?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn session_count(&self) -> StoreResult<i64> {
         let conn = self.lock()?;
         conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
             .map_err(|error| error.to_string())
+    }
+
+    pub fn source_meta_get(&self, source: &str, key: &str) -> StoreResult<Option<String>> {
+        let source = sources::canonical(source);
+        let value = self.meta_get(&format!("{key}:{source}"))?;
+        if value.is_none() && source == sources::CODEX {
+            return self.meta_get(key);
+        }
+        Ok(value)
     }
 
     pub fn meta_get(&self, key: &str) -> StoreResult<Option<String>> {
@@ -534,12 +782,170 @@ impl Store {
         Ok(())
     }
 
+    pub fn preference_bool(&self, key: &str, default: bool) -> bool {
+        self.meta_get(key)
+            .ok()
+            .flatten()
+            .map(|value| value == "true")
+            .unwrap_or(default)
+    }
+
     pub fn compact_database(&self) -> StoreResult<()> {
         let conn = self.lock()?;
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
             .map_err(|error| error.to_string())?;
         Ok(())
     }
+}
+
+fn model_failure_key(source: &str, session_id: &str) -> String {
+    format!(
+        "model_failure_pending:{}:{session_id}",
+        sources::canonical(source)
+    )
+}
+
+fn current_turn_id(
+    tx: &rusqlite::Transaction,
+    source: &str,
+    session_id: &str,
+) -> StoreResult<Option<String>> {
+    tx.query_row(
+        "SELECT turn_id FROM events
+         WHERE source = ?1 AND session_id = ?2 AND kind = 'prompt'
+         ORDER BY processed_at DESC, rowid DESC LIMIT 1",
+        params![source, session_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+pub fn external_unread_key(source: &str, session_id: &str) -> String {
+    format!(
+        "external_unread_observed:{}:{session_id}",
+        sources::canonical(source)
+    )
+}
+
+fn table_exists(conn: &Connection, name: &str) -> StoreResult<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        params![name],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn create_schema(conn: &Connection) -> StoreResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sessions (
+           source TEXT NOT NULL,
+           session_id TEXT NOT NULL,
+           session_title TEXT,
+           prompt_excerpt TEXT,
+           cwd TEXT,
+           client_type TEXT,
+           last_prompt_at INTEGER,
+           last_result_at INTEGER,
+           result_seq INTEGER NOT NULL DEFAULT 0,
+           unread INTEGER NOT NULL DEFAULT 0,
+           opened_at INTEGER,
+           dismissed_at INTEGER,
+           state TEXT NOT NULL DEFAULT 'completed',
+           activity TEXT,
+           updated_at INTEGER NOT NULL,
+           PRIMARY KEY(source, session_id)
+         );
+         CREATE TABLE IF NOT EXISTS events (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           source TEXT NOT NULL,
+           session_id TEXT NOT NULL,
+           turn_id TEXT NOT NULL,
+           kind TEXT NOT NULL,
+           processed_at INTEGER NOT NULL,
+           UNIQUE(source, session_id, turn_id, kind)
+         );
+         CREATE TABLE IF NOT EXISTS handled_turns (
+           source TEXT NOT NULL,
+           session_id TEXT NOT NULL,
+           turn_id TEXT NOT NULL,
+           handled_at INTEGER NOT NULL,
+           PRIMARY KEY(source, session_id, turn_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_handled_turns_at
+           ON handled_turns(handled_at);
+         CREATE TABLE IF NOT EXISTS meta (
+           key TEXT PRIMARY KEY,
+           value TEXT NOT NULL
+         );
+         PRAGMA user_version = 5;",
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn migrate_v3(conn: &mut Connection) -> StoreResult<()> {
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    tx.execute_batch(
+        "ALTER TABLE sessions RENAME TO sessions_v2;
+         ALTER TABLE events RENAME TO events_v2;
+         ALTER TABLE handled_turns RENAME TO handled_turns_v2;",
+    )
+    .map_err(|error| error.to_string())?;
+    create_schema(&tx)?;
+    tx.execute_batch(
+        "INSERT INTO sessions(
+           source, session_id, prompt_excerpt, last_prompt_at, last_result_at,
+           result_seq, unread, opened_at, updated_at
+         )
+         SELECT CASE WHEN source = 'desktop' THEN 'codex' ELSE source END,
+                session_id, prompt_excerpt, last_prompt_at, last_result_at,
+                result_seq, unread, opened_at, updated_at
+         FROM sessions_v2;
+         INSERT INTO events(source, session_id, turn_id, kind, processed_at)
+         SELECT 'codex', session_id, turn_id, kind, processed_at FROM events_v2;
+         INSERT INTO handled_turns(source, session_id, turn_id, handled_at)
+         SELECT 'codex', session_id, turn_id, handled_at FROM handled_turns_v2;
+         INSERT OR REPLACE INTO meta(key, value)
+         SELECT 'last_event_at:codex', value FROM meta WHERE key = 'last_event_at';
+         INSERT OR REPLACE INTO meta(key, value)
+         SELECT 'access_verified_at:codex', value FROM meta WHERE key = 'access_verified_at';
+         INSERT OR REPLACE INTO meta(key, value)
+         SELECT 'rejected_count:codex', value FROM meta WHERE key = 'rejected_count';
+         UPDATE sessions SET state = 'running', activity = '正在处理当前请求'
+         WHERE COALESCE(last_prompt_at, 0) > COALESCE(last_result_at, 0);
+         DROP TABLE sessions_v2;
+         DROP TABLE events_v2;
+         DROP TABLE handled_turns_v2;",
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn migrate_v4(conn: &mut Connection) -> StoreResult<()> {
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    tx.execute_batch(
+        "ALTER TABLE sessions ADD COLUMN state TEXT NOT NULL DEFAULT 'completed';
+         ALTER TABLE sessions ADD COLUMN activity TEXT;
+         UPDATE sessions SET state = 'running', activity = '正在处理当前请求'
+         WHERE COALESCE(last_prompt_at, 0) > COALESCE(last_result_at, 0);
+         PRAGMA user_version = 4;",
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn migrate_v5(conn: &mut Connection) -> StoreResult<()> {
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    tx.execute_batch(
+        "ALTER TABLE sessions ADD COLUMN dismissed_at INTEGER;
+         PRAGMA user_version = 5;",
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn now_ms() -> i64 {
@@ -558,23 +964,34 @@ mod tests {
     }
 
     fn event(kind: &str, session: &str, turn: &str, t: i64) -> HookEvent {
+        source_event("desktop", kind, session, turn, t)
+    }
+
+    fn source_event(source: &str, kind: &str, session: &str, turn: &str, t: i64) -> HookEvent {
         HookEvent {
             t,
             event: kind.to_string(),
             session_id: session.to_string(),
             turn_id: turn.to_string(),
-            source: "desktop".to_string(),
+            source: source.to_string(),
             prompt: Some("帮我整理发布清单并且检查所有阻塞项".to_string()),
+            session_title: Some("整理发布清单".to_string()),
+            cwd: Some("/tmp/project".to_string()),
+            client_type: Some("test".to_string()),
         }
     }
 
-    fn set_opened_at(store: &Store, session: &str, value: i64) {
+    fn seen(source: &str, session: &str) -> (String, String) {
+        (source.to_string(), session.to_string())
+    }
+
+    fn set_opened_at(store: &Store, source: &str, session: &str, value: i64) {
         store
             .lock()
             .unwrap()
             .execute(
-                "UPDATE sessions SET opened_at = ?1 WHERE session_id = ?2",
-                params![value, session],
+                "UPDATE sessions SET opened_at = ?1 WHERE source = ?2 AND session_id = ?3",
+                params![value, source, session],
             )
             .unwrap();
     }
@@ -585,21 +1002,152 @@ mod tests {
         store
             .apply(&event("UserPromptSubmit", "s1", "t1", 100))
             .unwrap();
-        assert!(store.list_sessions().unwrap().is_empty());
+        let running = store.list_sessions().unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].state, "running");
+        assert!(!running[0].unread);
         store.apply(&event("Stop", "s1", "t1", 200)).unwrap();
         let sessions = store.list_sessions().unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].result_seq, 1);
+        assert_eq!(sessions[0].source, "codex");
+        assert_eq!(sessions[0].session_title.as_deref(), Some("整理发布清单"));
+    }
+
+    #[test]
+    fn same_session_id_from_two_sources_stays_separate() {
+        let store = store();
+        store.apply(&event("Stop", "shared", "c1", 100)).unwrap();
+        store
+            .apply(&source_event("kimi-code", "Stop", "shared", "k1", 200))
+            .unwrap();
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 2);
+        store
+            .mark_seen_sessions(&[seen("kimi-code", "shared")])
+            .unwrap();
+        let remaining = store.list_sessions().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].source, "codex");
+    }
+
+    #[test]
+    fn interrupted_session_stops_running_without_becoming_a_result() {
+        let store = store();
+        store
+            .apply(&event("UserPromptSubmit", "s1", "t1", 100))
+            .unwrap();
+        store.apply(&event("Interrupt", "s1", "t1", 200)).unwrap();
+        assert!(store.list_sessions().unwrap().is_empty());
+        assert_eq!(store.count_unread().unwrap(), 0);
+    }
+
+    #[test]
+    fn running_session_cannot_be_marked_seen() {
+        let store = store();
+        store
+            .apply(&event("UserPromptSubmit", "s1", "t1", 100))
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET unread = 1 WHERE source = 'codex' AND session_id = 's1'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.mark_seen_sessions(&[seen("codex", "s1")]).unwrap(), 0);
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].state, "running");
+        assert!(sessions[0].unread);
+    }
+
+    #[test]
+    fn model_failure_finalizes_only_after_grace() {
+        let store = store();
+        store
+            .apply(&event("UserPromptSubmit", "s1", "t1", 100))
+            .unwrap();
+        store
+            .apply(&event("ModelRequestFailed", "s1", "t1", 200))
+            .unwrap();
+        assert_eq!(store.finalize_model_failures(5_199).unwrap(), 0);
+        assert_eq!(store.list_sessions().unwrap()[0].state, "running");
+        assert_eq!(store.finalize_model_failures(5_200).unwrap(), 1);
+        assert!(store.list_sessions().unwrap().is_empty());
+        assert_eq!(store.count_unread().unwrap(), 0);
+    }
+
+    #[test]
+    fn new_model_attempt_cancels_pending_failure() {
+        let store = store();
+        store
+            .apply(&event("UserPromptSubmit", "s1", "t1", 100))
+            .unwrap();
+        store
+            .apply(&event("ModelRequestFailed", "s1", "t1", 200))
+            .unwrap();
+        store
+            .apply(&event("PreModelRequest", "s1", "t1", 300))
+            .unwrap();
+        assert_eq!(store.finalize_model_failures(6_000).unwrap(), 0);
+        assert_eq!(store.list_sessions().unwrap()[0].state, "running");
+    }
+
+    #[test]
+    fn normal_stop_clears_pending_failure() {
+        let store = store();
+        store
+            .apply(&event("UserPromptSubmit", "s1", "t1", 100))
+            .unwrap();
+        store
+            .apply(&event("ModelRequestFailed", "s1", "t1", 200))
+            .unwrap();
+        store.apply(&event("Stop", "s1", "t1", 300)).unwrap();
+        assert_eq!(store.finalize_model_failures(6_000).unwrap(), 0);
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions[0].state, "completed");
+        assert!(sessions[0].unread);
+    }
+
+    #[test]
+    fn delayed_retry_restores_a_finalized_failure() {
+        let store = store();
+        store
+            .apply(&event("UserPromptSubmit", "s1", "t1", 100))
+            .unwrap();
+        store
+            .apply(&event("ModelRequestFailed", "s1", "t1", 200))
+            .unwrap();
+        store.finalize_model_failures(5_200).unwrap();
+        store
+            .apply(&event("PreModelRequest", "s1", "t1", 5_300))
+            .unwrap();
+        assert_eq!(store.list_sessions().unwrap()[0].state, "running");
+    }
+
+    #[test]
+    fn previous_turn_failure_does_not_end_a_new_turn() {
+        let store = store();
+        store
+            .apply(&event("UserPromptSubmit", "s1", "t1", 100))
+            .unwrap();
+        store
+            .apply(&event("UserPromptSubmit", "s1", "t2", 200))
+            .unwrap();
+        store
+            .apply(&event("ModelRequestFailed", "s1", "t1", 300))
+            .unwrap();
+        assert_eq!(store.finalize_model_failures(6_000).unwrap(), 0);
+        assert_eq!(store.list_sessions().unwrap()[0].state, "running");
     }
 
     #[test]
     fn seen_session_hides_but_is_retained() {
         let store = store();
         store.apply(&event("Stop", "s1", "t1", 200)).unwrap();
-        assert_eq!(
-            store.mark_seen_sessions(&["s1".to_string()]).unwrap(),
-            1
-        );
+        assert_eq!(store.mark_seen_sessions(&[seen("codex", "s1")]).unwrap(), 1);
         assert!(store.list_sessions().unwrap().is_empty());
         assert_eq!(store.session_count().unwrap(), 1);
         assert_eq!(store.count_unread().unwrap(), 0);
@@ -609,7 +1157,7 @@ mod tests {
     fn duplicate_stop_after_seen_is_ignored() {
         let store = store();
         store.apply(&event("Stop", "s1", "t1", 200)).unwrap();
-        store.mark_seen_sessions(&["s1".to_string()]).unwrap();
+        store.mark_seen_sessions(&[seen("codex", "s1")]).unwrap();
         assert!(!store.apply(&event("Stop", "s1", "t1", 300)).unwrap());
         assert!(store.list_sessions().unwrap().is_empty());
     }
@@ -618,11 +1166,14 @@ mod tests {
     fn new_turn_after_seen_reappears() {
         let store = store();
         store.apply(&event("Stop", "s1", "t1", 200)).unwrap();
-        store.mark_seen_sessions(&["s1".to_string()]).unwrap();
+        store.mark_seen_sessions(&[seen("codex", "s1")]).unwrap();
         store
             .apply(&event("UserPromptSubmit", "s1", "t2", 300))
             .unwrap();
-        assert!(store.list_sessions().unwrap().is_empty());
+        let running = store.list_sessions().unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].state, "running");
+        assert!(!running[0].unread);
         store.apply(&event("Stop", "s1", "t2", 400)).unwrap();
         let sessions = store.list_sessions().unwrap();
         assert_eq!(sessions.len(), 1);
@@ -636,9 +1187,7 @@ mod tests {
         store
             .apply(&event("UserPromptSubmit", "pending", "t2", 300))
             .unwrap();
-        store
-            .apply(&event("Stop", "pending", "t3", 400))
-            .unwrap();
+        store.apply(&event("Stop", "pending", "t3", 400)).unwrap();
         store
             .apply(&event("UserPromptSubmit", "pending", "t4", 500))
             .unwrap();
@@ -646,7 +1195,7 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "UPDATE sessions SET opened_at = 1 WHERE session_id = 'pending'",
+                "UPDATE sessions SET opened_at = 1 WHERE source = 'codex' AND session_id = 'pending'",
                 [],
             )
             .unwrap();
@@ -664,18 +1213,16 @@ mod tests {
                 .apply(&event("Stop", &session, &format!("t{index}"), 1000 + index))
                 .unwrap();
             store
-                .mark_seen_sessions(&[session.clone()])
+                .mark_seen_sessions(&[seen("codex", &session)])
                 .unwrap();
-            set_opened_at(&store, &session, recent + index);
+            set_opened_at(&store, "codex", &session, recent + index);
         }
         assert_eq!(store.prune_seen().unwrap(), 5);
         assert_eq!(store.session_count().unwrap(), 50);
 
-        store
-            .apply(&event("Stop", "old", "t-old", 10))
-            .unwrap();
-        store.mark_seen_sessions(&["old".to_string()]).unwrap();
-        set_opened_at(&store, "old", now_ms() - SEEN_RETENTION_MS - 1);
+        store.apply(&event("Stop", "old", "t-old", 10)).unwrap();
+        store.mark_seen_sessions(&[seen("codex", "old")]).unwrap();
+        set_opened_at(&store, "codex", "old", now_ms() - SEEN_RETENTION_MS - 1);
         assert_eq!(store.prune_seen().unwrap(), 1);
         assert!(!store
             .list_sessions()
@@ -708,8 +1255,8 @@ mod tests {
             let conn = store.lock().unwrap();
             for index in 0..510 {
                 conn.execute(
-                    "INSERT INTO handled_turns(session_id, turn_id, handled_at)
-                     VALUES (?1, ?2, ?3)",
+                    "INSERT INTO handled_turns(source, session_id, turn_id, handled_at)
+                     VALUES ('codex', ?1, ?2, ?3)",
                     params![format!("s{index}"), format!("t{index}"), recent + index],
                 )
                 .unwrap();
@@ -722,5 +1269,71 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM handled_turns", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 500);
+    }
+
+    #[test]
+    fn legacy_codex_rows_survive_source_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+               session_id TEXT PRIMARY KEY,
+               source TEXT NOT NULL,
+               prompt_excerpt TEXT,
+               last_prompt_at INTEGER,
+               last_result_at INTEGER,
+               result_seq INTEGER NOT NULL DEFAULT 0,
+               unread INTEGER NOT NULL DEFAULT 0,
+               opened_at INTEGER,
+               updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE events (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               session_id TEXT NOT NULL,
+               turn_id TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               processed_at INTEGER NOT NULL,
+               UNIQUE(session_id, turn_id, kind)
+             );
+             CREATE TABLE handled_turns (
+               session_id TEXT NOT NULL,
+               turn_id TEXT NOT NULL,
+               handled_at INTEGER NOT NULL,
+               PRIMARY KEY(session_id, turn_id)
+             );
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             PRAGMA user_version = 2;
+             INSERT INTO sessions(
+               session_id, source, prompt_excerpt, last_result_at,
+               result_seq, unread, updated_at
+             ) VALUES ('legacy', 'desktop', '旧任务', 100, 1, 1, 100);
+             INSERT INTO meta VALUES ('last_event_at', '100');",
+        )
+        .unwrap();
+        let store = Store::init(conn).unwrap();
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].source, "codex");
+        assert_eq!(sessions[0].prompt_excerpt.as_deref(), Some("旧任务"));
+        assert_eq!(
+            store.source_meta_get("codex", "last_event_at").unwrap(),
+            Some("100".to_string())
+        );
+    }
+
+    #[test]
+    fn source_status_uses_namespaced_metadata() {
+        let store = store();
+        store.apply(&event("Stop", "s1", "t1", 200)).unwrap();
+        store
+            .apply(&source_event("kimi-code", "Stop", "s2", "k1", 400))
+            .unwrap();
+        assert_eq!(
+            store.source_meta_get("codex", "last_event_at").unwrap(),
+            Some("200".to_string())
+        );
+        assert_eq!(
+            store.source_meta_get("kimi-code", "last_event_at").unwrap(),
+            Some("400".to_string())
+        );
     }
 }

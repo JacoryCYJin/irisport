@@ -1,6 +1,8 @@
 use crate::paths;
+use crate::sources;
 use crate::store::{HookEvent, Store};
 use crate::tray;
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -21,6 +23,12 @@ pub fn start(app: AppHandle, store: Store) {
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
         let mut ticks = 0u64;
+        let mut known_results = store
+            .list_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|session| ((session.source, session.session_id), session.result_seq))
+            .collect::<HashMap<_, _>>();
 
         loop {
             let mut changed = false;
@@ -45,14 +53,36 @@ pub fn start(app: AppHandle, store: Store) {
                 Err(error) => eprintln!("irisport: 读取事件收件箱失败: {error}"),
             }
 
+            match store.finalize_model_failures(now_ms()) {
+                Ok(count) => changed |= count > 0,
+                Err(error) => eprintln!("irisport: 结束失败任务时写入失败: {error}"),
+            }
+
             if changed {
                 if let Ok(count) = store.count_unread() {
                     tray::set_count(&app, count);
                 }
+                let sessions = store.list_sessions().unwrap_or_default();
+                let current_results = sessions
+                    .iter()
+                    .map(|session| {
+                        (
+                            (session.source.clone(), session.session_id.clone()),
+                            session.result_seq,
+                        )
+                    })
+                    .collect::<HashMap<_, _>>();
+                for session in sessions {
+                    let key = (session.source.clone(), session.session_id.clone());
+                    if session.result_seq > known_results.get(&key).copied().unwrap_or(0) {
+                        let _ = app.emit("task-completed", &session);
+                    }
+                }
+                known_results = current_results;
                 let _ = app.emit("sessions-updated", ());
             }
             if touched {
-                let _ = app.emit("hook-status-updated", ());
+                let _ = app.emit("source-status-updated", ());
             }
 
             ticks += 1;
@@ -160,8 +190,8 @@ pub fn drain_legacy_once(store: &Store, offset: &mut u64) -> Result<(bool, bool)
 }
 
 fn handle_event(store: &Store, event: &HookEvent) -> bool {
-    if event.source != "desktop" {
-        let _ = store.increment_rejected();
+    if !sources::accepts_events(&event.source) {
+        let _ = store.increment_rejected(&event.source);
         return false;
     }
     let processed_at = now_ms();
