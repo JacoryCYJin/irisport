@@ -23,6 +23,10 @@ export interface SourceStatus {
   configured: boolean;
   update_available: boolean;
   access_verified: boolean;
+  verified_current: boolean;
+  runtime_ready: boolean;
+  issue: string | null;
+  checked_at: number;
   supports_completion: boolean;
   supports_open: boolean;
   supports_auto_read: boolean;

@@ -66,13 +66,21 @@ function navigate(value: SettingsSection) {
 function connectionLabel(source: SourceStatus) {
   if (!source.supports_completion) return source.installed ? "已安装" : "未安装";
   if (!source.installed) return "未安装";
+  if (source.issue) return "需要处理";
   if (!source.configured) return "未连接";
-  if (!source.access_verified) return "等待验证";
-  return "已连接";
+  if (source.update_available) return "可更新";
+  if (!source.verified_current) return "等待验证";
+  return "已验证";
 }
 
 function connectionTone(source: SourceStatus) {
-  if (source.configured && source.access_verified && source.supports_completion) return "ok";
+  if (
+    source.configured &&
+    source.verified_current &&
+    !source.update_available &&
+    !source.issue &&
+    source.supports_completion
+  ) return "ok";
   if (source.configured || source.installed) return "wait";
   return "idle";
 }
@@ -86,6 +94,19 @@ async function refresh() {
     status.value = await api.appStatus();
   } catch (error) {
     setMessage(`读取来源状态失败：${String(error)}`, "error");
+  }
+}
+
+async function checkSources() {
+  busy.value = true;
+  setMessage("");
+  try {
+    status.value = await api.appStatus();
+    setMessage("来源健康检查已完成。");
+  } catch (error) {
+    setMessage(`来源检查失败：${String(error)}`, "error");
+  } finally {
+    busy.value = false;
   }
 }
 
@@ -104,7 +125,7 @@ async function install(source: SourceStatus) {
     status.value = await api.installSource(source.source);
     setMessage(
       source.source === "codex"
-        ? "Codex 配置已写入。如出现提示，请重新信任 Irisport hooks，然后发送一次任务。"
+        ? "ChatGPT 配置已写入。如出现提示，请重新信任 Irisport hooks，然后发送一次任务。"
         : source.source === "workbuddy"
           ? "WorkBuddy 配置已写入。请开始一个新会话，并发送一次任务验证 hooks。"
           : "Kimi Code 配置已写入。请开始一个新会话，让 hooks 生效。",
@@ -277,7 +298,7 @@ onUnmounted(() => {
         <div class="settings-list">
           <ToggleRow
             label="完成时显示系统通知"
-            description="使用 macOS 通知中心接收 Codex、Kimi Code 和 WorkBuddy 的新结果。"
+            description="使用 macOS 通知中心接收 ChatGPT、Kimi Code 和 WorkBuddy 的新结果。"
             :model-value="preferences.notifications_enabled"
             @change="setNotifications"
           />
@@ -364,13 +385,23 @@ onUnmounted(() => {
             <h2 class="group-title">接入状态</h2>
             <div class="settings-list compact-list">
               <div class="settings-item"><span>配置</span><span>{{ activeSource.configured ? "已写入" : "未写入" }}</span></div>
-              <div class="settings-item"><span>接入验证</span><span>{{ activeSource.access_verified ? "已收到真实事件" : "等待真实事件" }}</span></div>
+              <div class="settings-item"><span>Hook 程序</span><span>{{ activeSource.runtime_ready ? "存在且可执行" : "缺失或不可执行" }}</span></div>
+              <div class="settings-item"><span>接入验证</span><span>{{ activeSource.verified_current ? "当前配置已收到真实事件" : "等待当前配置的真实事件" }}</span></div>
               <div class="settings-item"><span>最近事件</span><span>{{ lastEvent(activeSource) }}</span></div>
+              <div class="settings-item"><span>本次检查</span><span>{{ formatRelative(activeSource.checked_at) }}</span></div>
               <div class="settings-item"><span>未通过校验</span><span>{{ activeSource.rejected_count }}</span></div>
             </div>
           </template>
 
           <div class="source-detail-actions">
+            <button
+              v-if="activeSource.supports_completion"
+              class="button"
+              :disabled="busy"
+              @click="checkSources"
+            >
+              重新检查
+            </button>
             <button
               v-if="activeSource.supports_completion && !activeSource.configured"
               class="button primary"
@@ -396,16 +427,19 @@ onUnmounted(() => {
               断开连接
             </button>
             <button class="button" :disabled="!activeSource.installed" @click="openSource(activeSource)">
-              {{ activeSource.source === 'codex' ? '打开 Codex 设置' : `打开 ${activeSource.label}` }}
+              {{ activeSource.source === 'codex' ? '打开 ChatGPT 设置' : `打开 ${activeSource.label}` }}
             </button>
           </div>
+          <p v-if="activeSource.issue" class="settings-note warn">
+            {{ activeSource.issue }}
+          </p>
           <p v-if="activeSource.update_available" class="settings-note">
             有新的任务状态规则。更新后，如原应用提示，请重新信任 Irisport hooks。
           </p>
           <p v-if="!activeSource.installed" class="settings-note warn">
             未检测到 {{ activeSource.label }} 应用。请先安装应用，再连接来源。
           </p>
-          <p v-else-if="activeSource.configured && !activeSource.access_verified" class="settings-note warn">
+          <p v-else-if="activeSource.configured && !activeSource.verified_current" class="settings-note warn">
             配置已写入但尚未收到真实事件。请开始一个新会话并发送一次任务。
           </p>
         </template>
@@ -422,7 +456,7 @@ onUnmounted(() => {
             <button class="button secondary" @click="reveal('app-data')">在 Finder 中显示</button>
           </div>
           <div class="data-row">
-            <div><span class="item-title">Codex hooks</span><span class="item-sub">仅管理包含 Irisport 标识的规则</span></div>
+            <div><span class="item-title">ChatGPT hooks</span><span class="item-sub">仅管理包含 Irisport 标识的规则</span></div>
             <button class="button secondary" @click="reveal('codex-hooks')">在 Finder 中显示</button>
           </div>
           <div class="data-row">

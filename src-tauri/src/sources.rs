@@ -43,7 +43,7 @@ pub fn canonical(source: &str) -> &str {
 
 pub fn label(source: &str) -> &'static str {
     match kind(source) {
-        SourceKind::Codex => "Codex",
+        SourceKind::Codex => "ChatGPT",
         SourceKind::KimiCode => "Kimi Code",
         SourceKind::WorkBuddy => "WorkBuddy",
         SourceKind::CommandCode => "Command Code",
@@ -54,7 +54,7 @@ pub fn label(source: &str) -> &'static str {
 
 pub fn description(source: &str) -> &'static str {
     match kind(source) {
-        SourceKind::Codex => "通过本地 hooks 接收 Codex 桌面端的进行中状态、工作时间和完成结果。",
+        SourceKind::Codex => "通过本地 hooks 接收 ChatGPT 桌面端的进行中状态、工作时间和完成结果。",
         SourceKind::KimiCode => "接收 Kimi Code 的任务状态、工作时间和完成结果；在原应用查看后通过真实未读状态清除提醒。",
         SourceKind::WorkBuddy => "接收 WorkBuddy 的任务状态、工作时间和完成结果；在原应用查看后通过真实未读状态清除提醒。",
         SourceKind::CommandCode => "Command Code 完成事件仍处于验证阶段。",
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn labels_and_legacy_sources_are_normalized() {
-        assert_eq!(label("desktop"), "Codex");
+        assert_eq!(label("desktop"), "ChatGPT");
         assert_eq!(canonical("desktop"), "codex");
         assert_eq!(label("kimi-code"), "Kimi Code");
         assert_eq!(label("workbuddy"), "WorkBuddy");

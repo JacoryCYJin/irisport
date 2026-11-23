@@ -23,6 +23,10 @@ pub struct SourceStatusView {
     configured: bool,
     update_available: bool,
     access_verified: bool,
+    verified_current: bool,
+    runtime_ready: bool,
+    issue: Option<String>,
+    checked_at: i64,
     supports_completion: bool,
     supports_open: bool,
     supports_auto_read: bool,
@@ -326,14 +330,38 @@ fn copy_hook_binary(app: &AppHandle) -> Result<(), String> {
 
 fn build_status(store: &Store) -> Result<AppStatusView, String> {
     let mut source_statuses = Vec::new();
+    let runtime_ready = hook_runtime_ready();
+    let checked_at = now_ms();
     for source in sources::ALL {
         let kind = sources::kind(source);
-        let (configured, entries) = match kind {
-            SourceKind::Codex => hooks_config::configured()?,
-            SourceKind::KimiCode => kimi_code::configured()?,
-            SourceKind::WorkBuddy => workbuddy::configured()?,
-            _ => (false, 0),
+        let mut issue = None;
+        let (configured, entries) = match match kind {
+            SourceKind::Codex => hooks_config::configured(),
+            SourceKind::KimiCode => kimi_code::configured(),
+            SourceKind::WorkBuddy => workbuddy::configured(),
+            _ => Ok((false, 0)),
+        } {
+            Ok(result) => result,
+            Err(error) => {
+                issue = Some(format!("配置无法读取：{error}"));
+                (false, 0)
+            }
         };
+        if configured && !runtime_ready {
+            issue = Some("Hook 执行文件缺失或不可执行".to_string());
+        }
+        if configured && issue.is_none() {
+            match match kind {
+                SourceKind::Codex => hooks_config::uses_current_wrapper(),
+                SourceKind::KimiCode => kimi_code::uses_current_wrapper(),
+                SourceKind::WorkBuddy => workbuddy::uses_current_wrapper(),
+                _ => Ok(true),
+            } {
+                Ok(true) => {}
+                Ok(false) => issue = Some("Hook 配置指向了旧路径".to_string()),
+                Err(error) => issue = Some(format!("Hook 路径检查失败：{error}")),
+            }
+        }
         let expected_entries = match kind {
             SourceKind::Codex => hooks_config::expected_entries(),
             SourceKind::KimiCode => kimi_code::expected_entries(),
@@ -355,6 +383,14 @@ fn build_status(store: &Store) -> Result<AppStatusView, String> {
         let last_event_at = store
             .source_meta_get(source, "last_event_at")?
             .and_then(|value| value.parse::<i64>().ok());
+        let hooks_installed_at = store
+            .source_meta_get(source, "hooks_installed_at")?
+            .and_then(|value| value.parse::<i64>().ok());
+        let access_verified = store
+            .source_meta_get(source, "access_verified_at")?
+            .is_some();
+        let verified_current =
+            current_config_verified(access_verified, last_event_at, hooks_installed_at);
         let rejected_count = store
             .source_meta_get(source, "rejected_count")?
             .and_then(|value| value.parse::<usize>().ok())
@@ -366,9 +402,11 @@ fn build_status(store: &Store) -> Result<AppStatusView, String> {
             installed,
             configured,
             update_available: configured && entries < expected_entries,
-            access_verified: store
-                .source_meta_get(source, "access_verified_at")?
-                .is_some(),
+            access_verified,
+            verified_current,
+            runtime_ready,
+            issue,
+            checked_at,
             supports_completion: sources::accepts_events(source),
             supports_open: sources::supports_open(source),
             supports_auto_read: sources::read_signal(source) == ReadSignal::Trusted,
@@ -383,6 +421,33 @@ fn build_status(store: &Store) -> Result<AppStatusView, String> {
         data_path: paths::support_dir().display().to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
+}
+
+fn hook_runtime_ready() -> bool {
+    [&paths::hook_binary(), &paths::hook_wrapper()]
+        .into_iter()
+        .all(|path| executable_file(path))
+}
+
+fn executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+fn current_config_verified(
+    access_verified: bool,
+    last_event_at: Option<i64>,
+    hooks_installed_at: Option<i64>,
+) -> bool {
+    access_verified
+        && hooks_installed_at
+            .map(|installed_at| {
+                last_event_at
+                    .map(|last_event| last_event >= installed_at)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true)
 }
 
 fn run_open(command: &mut Command) -> OpenResultView {
@@ -428,4 +493,31 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn updated_hooks_require_a_new_real_event() {
+        assert!(current_config_verified(true, Some(200), Some(100)));
+        assert!(!current_config_verified(true, Some(100), Some(200)));
+        assert!(!current_config_verified(true, None, Some(200)));
+        assert!(current_config_verified(true, Some(100), None));
+        assert!(!current_config_verified(false, Some(200), None));
+    }
+
+    #[test]
+    fn executable_check_requires_a_file_and_execute_permission() {
+        let path =
+            std::env::temp_dir().join(format!("irisport-health-executable-{}", std::process::id()));
+        fs::write(&path, "test").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!executable_file(&path));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(executable_file(&path));
+        let _ = fs::remove_file(&path);
+        assert!(!executable_file(&path));
+    }
 }

@@ -32,6 +32,7 @@
 - 已读记录最多保留 7 天或 50 条；未读和进行中的请求不受限制。已消费事件处理完即删除，延迟日志最多 200 行。
 - 不保存完整 hook JSON、请求正文、回复正文或 transcript 内容，也不读取 `wire.jsonl`。
 - `~/.codex/hooks.json`、`~/.kimi-code/config.toml` 与 `~/.workbuddy/settings.json` 只由用户显式操作安装或撤销；不得覆盖其他配置、注释或 hooks。Kimi Code 配置使用保留格式的 TOML 编辑。
+- 来源健康检查只读应用、Hook 配置、执行文件、当前 wrapper 路径和真实事件记录；不得自动写配置或发送测试任务。无活动事件不等于断开；更新 Hook 后必须收到不早于 `hooks_installed_at` 的新事件，才恢复当前配置“已验证”。单个来源配置错误不得阻断其他来源状态。
 
 ## 开发
 
