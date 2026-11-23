@@ -1,9 +1,10 @@
 use crate::commands;
 use crate::panel;
+use crate::store::Store;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 pub const TRAY_ID: &str = "main";
 
@@ -13,10 +14,8 @@ pub fn create(app: &AppHandle, count: i64) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "退出 Irisport", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &settings, &quit])?;
 
-    let icon = icon_for_count(count)?;
-
     let tray = TrayIconBuilder::with_id(TRAY_ID)
-        .icon(icon)
+        .icon(icon_for_count(count)?)
         .icon_as_template(true)
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -25,7 +24,7 @@ pub fn create(app: &AppHandle, count: i64) -> tauri::Result<()> {
             "open" => panel::toggle(app, None),
             "settings" => {
                 panel::hide(app);
-                let _ = commands::show_settings(app);
+                let _ = commands::show_settings(app, None);
             }
             "quit" => app.exit(0),
             _ => {}
@@ -43,16 +42,15 @@ pub fn create(app: &AppHandle, count: i64) -> tauri::Result<()> {
         })
         .build(app)?;
 
-    set_count_labels(&tray, count);
+    set_count_labels(app, &tray, count);
     Ok(())
 }
 
 fn icon_for_count(count: i64) -> tauri::Result<Image<'static>> {
-    let bytes: &[u8] = match count {
-        ..=0 => include_bytes!("../icons/tray.png"),
-        1 => include_bytes!("../icons/tray-lit.png"),
-        2 => include_bytes!("../icons/tray-lit-medium.png"),
-        _ => include_bytes!("../icons/tray-lit-high.png"),
+    let bytes: &[u8] = if count > 0 {
+        include_bytes!("../icons/tray-unread.png")
+    } else {
+        include_bytes!("../icons/tray.png")
     };
     Image::from_bytes(bytes)
 }
@@ -64,13 +62,28 @@ pub fn set_count(app: &AppHandle, count: i64) {
     if let Ok(icon) = icon_for_count(count) {
         let _ = tray.set_icon_with_as_template(Some(icon), true);
     }
-    set_count_labels(&tray, count);
+    set_count_labels(app, &tray, count);
 }
 
-fn set_count_labels(tray: &TrayIcon, count: i64) {
-    // Clear any title persisted by an older build; the menu bar now uses only
-    // the bulb brightness. The exact count stays available in the tooltip.
-    let _ = tray.set_title(Some(""));
+pub fn refresh(app: &AppHandle) {
+    if let Some(store) = app.try_state::<Store>() {
+        if let Ok(count) = store.count_unread() {
+            set_count(app, count);
+        }
+    }
+}
+
+fn set_count_labels(app: &AppHandle, tray: &TrayIcon, count: i64) {
+    let show_count = app
+        .try_state::<Store>()
+        .map(|store| store.preference_bool("show_unread_count", false))
+        .unwrap_or(false);
+    let title = if show_count && count > 0 {
+        count.to_string()
+    } else {
+        String::new()
+    };
+    let _ = tray.set_title(Some(title.as_str()));
     let tooltip = if count > 0 {
         format!("Irisport · {count} 个待查看结果")
     } else {

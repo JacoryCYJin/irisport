@@ -51,6 +51,40 @@ pub fn codex_home() -> PathBuf {
     }
 }
 
+pub fn kimi_code_home() -> PathBuf {
+    if let Some(home) = std::env::var_os("KIMI_CODE_HOME") {
+        return PathBuf::from(home);
+    }
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join(".kimi-code"),
+        None => PathBuf::from(".kimi-code"),
+    }
+}
+
+pub fn kimi_code_config_path() -> PathBuf {
+    kimi_code_home().join("config.toml")
+}
+
+pub fn kimi_code_app_home() -> PathBuf {
+    if let Some(home) = std::env::var_os("KIMI_CODE_APP_HOME") {
+        return PathBuf::from(home);
+    }
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join("Library/Application Support/kimi-code-app"),
+        None => PathBuf::from("kimi-code-app"),
+    }
+}
+
+pub fn workbuddy_home() -> PathBuf {
+    if let Some(home) = std::env::var_os("WORKBUDDY_HOME") {
+        return PathBuf::from(home);
+    }
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join(".workbuddy"),
+        None => PathBuf::from(".workbuddy"),
+    }
+}
+
 pub fn codex_state_path() -> Option<PathBuf> {
     let home = codex_home();
     let preferred = home.join("state_5.sqlite");

@@ -1,3 +1,4 @@
+use serde_json::json;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, Read, Write};
@@ -11,72 +12,195 @@ const MAX_INPUT: u64 = 1_000_000;
 const PROMPT_LIMIT: usize = 200;
 static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceArg {
+    Codex,
+    KimiCode,
+    WorkBuddy,
+}
+
+#[derive(Debug)]
+struct NormalizedEvent {
+    event: String,
+    session_id: String,
+    turn_id: String,
+    source: String,
+    prompt: Option<String>,
+    session_title: Option<String>,
+    cwd: Option<String>,
+    client_type: Option<String>,
+    evidence: String,
+}
+
 fn main() {
     let _ = run();
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let probe = std::env::args().any(|arg| arg == "--probe");
+    let args: Vec<String> = std::env::args().collect();
+    let probe = args.iter().any(|arg| arg == "--probe");
+    let source_arg = args
+        .windows(2)
+        .find(|pair| pair[0] == "--source")
+        .and_then(|pair| match pair[1].as_str() {
+            "codex" => Some(SourceArg::Codex),
+            "kimi-code" => Some(SourceArg::KimiCode),
+            "workbuddy" => Some(SourceArg::WorkBuddy),
+            _ => None,
+        })
+        .unwrap_or(SourceArg::Codex);
 
     let mut input = String::new();
-    std::io::stdin().take(MAX_INPUT).read_to_string(&mut input)?;
+    std::io::stdin()
+        .take(MAX_INPUT)
+        .read_to_string(&mut input)?;
     let payload: serde_json::Value = match serde_json::from_str(&input) {
         Ok(value) => value,
         Err(_) => return Ok(()),
     };
-
-    let event = payload
-        .get("hook_event_name")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-    if event != "UserPromptSubmit" && event != "Stop" {
-        return Ok(());
-    }
-
-    let session_id = payload
-        .get("session_id")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-    if session_id.is_empty() {
-        return Ok(());
-    }
-
-    let turn_id = payload
-        .get("turn_id")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-    let source = classify_source(&payload);
     let now = now_ms();
+    let Some(event) = normalize_event(&payload, source_arg, now) else {
+        return Ok(());
+    };
     let home = support_home();
 
     if probe {
-        let record = serde_json::json!({
+        let record = json!({
             "t": now,
-            "event": event,
-            "session_id": session_id,
-            "turn_id": turn_id,
-            "source": source.code,
-            "evidence": source.evidence,
-            "deep_link": deep_link(session_id),
+            "event": event.event,
+            "session_id": event.session_id,
+            "turn_id": event.turn_id,
+            "source": event.source,
+            "evidence": event.evidence,
+            "deep_link": deep_link(&event.source, &event.session_id),
         });
         append_json(&home.join("probe/events.jsonl"), &record)?;
         return Ok(());
     }
 
-    let mut record = serde_json::json!({
+    let mut record = json!({
         "t": now,
-        "event": event,
-        "session_id": session_id,
-        "turn_id": turn_id,
-        "source": source.code,
+        "event": event.event,
+        "session_id": event.session_id,
+        "turn_id": event.turn_id,
+        "source": event.source,
     });
-    if event == "UserPromptSubmit" {
-        if let Some(prompt) = payload.get("prompt").and_then(|value| value.as_str()) {
-            record["prompt"] = serde_json::Value::String(excerpt(prompt));
-        }
+    if let Some(prompt) = event.prompt {
+        record["prompt"] = json!(prompt);
+    }
+    if let Some(title) = event.session_title {
+        record["session_title"] = json!(title);
+    }
+    if let Some(cwd) = event.cwd {
+        record["cwd"] = json!(cwd);
+    }
+    if let Some(client_type) = event.client_type {
+        record["client_type"] = json!(client_type);
     }
     write_inbox_event(&home, &record)?;
     Ok(())
+}
+
+fn normalize_event(
+    payload: &serde_json::Value,
+    source_arg: SourceArg,
+    now: i64,
+) -> Option<NormalizedEvent> {
+    let event = string_field(payload, "hook_event_name")?;
+    let session_id = string_field(payload, "session_id")?;
+    if session_id.is_empty() {
+        return None;
+    }
+
+    let (event, turn_id, source, evidence) = match source_arg {
+        SourceArg::Codex => {
+            let event = match event.as_str() {
+                "UserPromptSubmit" | "Stop" | "Interrupt" | "PreModelRequest" => event,
+                "PostModelRequest"
+                    if matches!(
+                        string_field(payload, "status").as_deref(),
+                        Some("failed" | "cancelled")
+                    ) =>
+                {
+                    "ModelRequestFailed".to_string()
+                }
+                _ => return None,
+            };
+            let source = classify_source(payload);
+            let turn_id = event_turn_id(payload, &event, now);
+            (event, turn_id, source.code.to_string(), source.evidence)
+        }
+        SourceArg::KimiCode => {
+            let canonical_event = match event.as_str() {
+                "TurnStarted" | "UserPromptSubmit" => "TurnStarted",
+                "Stop" => "Stop",
+                "Notification" => "Notification",
+                "StopFailure" => "StopFailure",
+                "Interrupt" => "Interrupt",
+                _ => return None,
+            };
+            let turn_id = event_turn_id(payload, canonical_event, now);
+            (
+                canonical_event.to_string(),
+                turn_id,
+                "kimi-code".to_string(),
+                "explicit:kimi-code".to_string(),
+            )
+        }
+        SourceArg::WorkBuddy => {
+            if !matches!(event.as_str(), "UserPromptSubmit" | "Stop") {
+                return None;
+            }
+            if event == "Stop"
+                && payload
+                    .get("stop_hook_active")
+                    .and_then(|value| value.as_bool())
+                    == Some(true)
+            {
+                return None;
+            }
+            let turn_id = event_turn_id(payload, &event, now);
+            (
+                event.to_string(),
+                turn_id,
+                "workbuddy".to_string(),
+                "explicit:workbuddy".to_string(),
+            )
+        }
+    };
+
+    let prompt = if event == "TurnStarted" || event == "UserPromptSubmit" {
+        string_field(payload, "prompt").map(|value| excerpt(&value))
+    } else {
+        None
+    };
+    let client_type = string_field(payload, "client_type")
+        .or_else(|| (source_arg == SourceArg::WorkBuddy).then(|| "workbuddy_desktop".to_string()));
+    Some(NormalizedEvent {
+        event,
+        session_id,
+        turn_id,
+        source,
+        prompt,
+        session_title: string_field(payload, "session_title"),
+        cwd: string_field(payload, "cwd"),
+        client_type,
+        evidence,
+    })
+}
+
+fn event_turn_id(payload: &serde_json::Value, event: &str, now: i64) -> String {
+    let turn_id = string_field(payload, "turn_id")
+        .or_else(|| string_field(payload, "task_id"))
+        .unwrap_or_else(|| format!("{}-{now}", event.to_lowercase()));
+    turn_id
+}
+
+fn string_field(payload: &serde_json::Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
 }
 
 struct Source {
@@ -92,7 +216,7 @@ fn classify_source(payload: &serde_json::Value) -> Source {
         .any(|command| command.contains("/Applications/ChatGPT.app/"))
     {
         return Source {
-            code: "desktop",
+            code: "codex",
             evidence: "ancestor:ChatGPT.app".to_string(),
         };
     }
@@ -108,7 +232,7 @@ fn classify_source(payload: &serde_json::Value) -> Source {
     if let Some((originator, transcript_source)) = transcript_markers(payload) {
         if originator == "Codex Desktop" || originator == "codex_work_desktop" {
             return Source {
-                code: "desktop",
+                code: "codex",
                 evidence: format!("transcript:{originator}"),
             };
         }
@@ -206,15 +330,17 @@ fn excerpt(prompt: &str) -> String {
     normalized.chars().take(PROMPT_LIMIT).collect()
 }
 
-fn deep_link(session_id: &str) -> String {
-    format!("codex://threads/{}", encode_component(session_id))
+fn deep_link(source: &str, session_id: &str) -> Option<String> {
+    if source != "codex" {
+        return None;
+    }
+    Some(format!("codex://threads/{}", encode_component(session_id)))
 }
 
 fn encode_component(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
-        let allowed = byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_' | b'.' | b'~');
+        let allowed = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
         if allowed {
             encoded.push(byte as char);
         } else {
@@ -277,4 +403,172 @@ fn append_json(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
     let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     file.write_all(line.as_bytes())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kimi_turn_and_stop_keep_session_metadata() {
+        let turn = normalize_event(
+            &json!({
+                "hook_event_name": "TurnStarted",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "session_title": "修复设置页",
+                "client_type": "kimi_code_desktop",
+                "cwd": "/tmp/project",
+                "prompt": "修复  设置页\n并补齐测试"
+            }),
+            SourceArg::KimiCode,
+            100,
+        )
+        .unwrap();
+        assert_eq!(turn.event, "TurnStarted");
+        assert_eq!(turn.source, "kimi-code");
+        assert_eq!(turn.session_title.as_deref(), Some("修复设置页"));
+        assert_eq!(turn.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(turn.prompt.as_deref(), Some("修复 设置页 并补齐测试"));
+
+        let stop = normalize_event(
+            &json!({
+                "hook_event_name": "Stop",
+                "session_id": "session-1",
+                "turn_id": "turn-1"
+            }),
+            SourceArg::KimiCode,
+            200,
+        )
+        .unwrap();
+        assert_eq!(stop.event, "Stop");
+        assert_eq!(stop.turn_id, "turn-1");
+    }
+
+    #[test]
+    fn kimi_background_completion_uses_task_id() {
+        let event = normalize_event(
+            &json!({
+                "hook_event_name": "Notification",
+                "session_id": "session-1",
+                "task_id": "task-9",
+                "session_title": "整理资料"
+            }),
+            SourceArg::KimiCode,
+            300,
+        )
+        .unwrap();
+        assert_eq!(event.event, "Notification");
+        assert_eq!(event.turn_id, "task-9");
+        assert!(event.prompt.is_none());
+    }
+
+    #[test]
+    fn workbuddy_prompt_and_stop_are_normalized() {
+        let prompt = normalize_event(
+            &json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "wb-session",
+                "prompt": "整理今日工作结果",
+                "cwd": "/tmp/work"
+            }),
+            SourceArg::WorkBuddy,
+            100,
+        )
+        .unwrap();
+        assert_eq!(prompt.event, "UserPromptSubmit");
+        assert_eq!(prompt.source, "workbuddy");
+        assert_eq!(prompt.prompt.as_deref(), Some("整理今日工作结果"));
+        assert_eq!(prompt.client_type.as_deref(), Some("workbuddy_desktop"));
+
+        let stop = normalize_event(
+            &json!({"hook_event_name":"Stop","session_id":"wb-session"}),
+            SourceArg::WorkBuddy,
+            200,
+        )
+        .unwrap();
+        assert_eq!(stop.event, "Stop");
+        assert!(!stop.turn_id.is_empty());
+    }
+
+    #[test]
+    fn workbuddy_continuation_stop_is_ignored() {
+        assert!(normalize_event(
+            &json!({
+                "hook_event_name":"Stop",
+                "session_id":"wb-session",
+                "stop_hook_active":true
+            }),
+            SourceArg::WorkBuddy,
+            200,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn codex_model_failure_is_normalized_without_accepting_success() {
+        let failed = normalize_event(
+            &json!({
+                "hook_event_name": "PostModelRequest",
+                "session_id": "s1",
+                "turn_id": "t1",
+                "status": "failed"
+            }),
+            SourceArg::Codex,
+            200,
+        )
+        .unwrap();
+        assert_eq!(failed.event, "ModelRequestFailed");
+        assert_eq!(failed.turn_id, "t1");
+
+        assert!(normalize_event(
+            &json!({
+                "hook_event_name": "PostModelRequest",
+                "session_id": "s1",
+                "turn_id": "t1",
+                "status": "completed"
+            }),
+            SourceArg::Codex,
+            300,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn codex_model_attempt_start_is_preserved() {
+        let event = normalize_event(
+            &json!({
+                "hook_event_name": "PreModelRequest",
+                "session_id": "s1",
+                "turn_id": "t1"
+            }),
+            SourceArg::Codex,
+            100,
+        )
+        .unwrap();
+        assert_eq!(event.event, "PreModelRequest");
+        assert_eq!(event.turn_id, "t1");
+    }
+
+    #[test]
+    fn unrelated_events_are_ignored() {
+        for name in ["PostToolUse", "SessionStart"] {
+            assert!(normalize_event(
+                &json!({"hook_event_name": name, "session_id": "s1"}),
+                SourceArg::KimiCode,
+                100,
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn missing_session_id_is_ignored() {
+        assert!(normalize_event(
+            &json!({"hook_event_name": "Stop", "turn_id": "t1"}),
+            SourceArg::KimiCode,
+            100,
+        )
+        .is_none());
+    }
 }

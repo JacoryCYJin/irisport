@@ -6,7 +6,7 @@ pub fn toggle(app: &AppHandle, rect: Option<tauri::Rect>) {
     };
 
     if window.is_visible().unwrap_or(false) {
-        let _ = window.hide();
+        hide(app);
         return;
     }
 
@@ -30,6 +30,23 @@ pub fn hide(app: &AppHandle) {
     }
 }
 
+pub fn show(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("panel") else {
+        return;
+    };
+    if window.is_visible().unwrap_or(false) {
+        let _ = window.set_focus();
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.show();
+    }
+    let _ = window.show();
+    let _ = window.set_focus();
+    let _ = app.emit("panel-opened", ());
+}
+
 fn position(window: &WebviewWindow, rect: tauri::Rect) {
     let scale = window.scale_factor().unwrap_or(1.0);
     let (x, y, width, height) = match (rect.position, rect.size) {
@@ -51,17 +68,14 @@ fn position(window: &WebviewWindow, rect: tauri::Rect) {
             size.width as f64,
             size.height as f64,
         ),
-        (Position::Logical(position), Size::Logical(size)) => (
-            position.x,
-            position.y,
-            size.width,
-            size.height,
-        ),
+        (Position::Logical(position), Size::Logical(size)) => {
+            (position.x, position.y, size.width, size.height)
+        }
     };
 
     let window_size = window
         .outer_size()
-        .unwrap_or(tauri::PhysicalSize::new(360, 480));
+        .unwrap_or(tauri::PhysicalSize::new(380, 520));
     let panel_width = window_size.width as f64;
     let panel_height = window_size.height as f64;
 
@@ -84,5 +98,8 @@ fn position(window: &WebviewWindow, rect: tauri::Rect) {
         );
     }
 
-    let _ = window.set_position(PhysicalPosition::new(left.round() as i32, top.round() as i32));
+    let _ = window.set_position(PhysicalPosition::new(
+        left.round() as i32,
+        top.round() as i32,
+    ));
 }
