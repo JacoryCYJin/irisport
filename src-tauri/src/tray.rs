@@ -6,6 +6,9 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 pub const TRAY_ID: &str = "main";
 
 pub fn create(app: &AppHandle, count: i64) -> tauri::Result<()> {
@@ -13,10 +16,9 @@ pub fn create(app: &AppHandle, count: i64) -> tauri::Result<()> {
     let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出 Irisport", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &settings, &quit])?;
-
     let tray = TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon_for_count(count)?)
-        .icon_as_template(false)
+        .icon_as_template(true)
         .menu(&menu)
         .show_menu_on_left_click(false)
         .tooltip("Irisport")
@@ -42,15 +44,18 @@ pub fn create(app: &AppHandle, count: i64) -> tauri::Result<()> {
         })
         .build(app)?;
 
-    set_count_labels(app, &tray, count);
+    update_tray(app, &tray, count);
     Ok(())
 }
 
 fn icon_for_count(count: i64) -> tauri::Result<Image<'static>> {
-    let bytes: &[u8] = if count > 0 {
-        include_bytes!("../icons/tray-unread.png")
-    } else {
+    #[cfg(target_os = "macos")]
+    let bytes = macos::template_bytes(count > 0);
+    #[cfg(not(target_os = "macos"))]
+    let bytes: &[u8] = if count <= 0 {
         include_bytes!("../icons/tray.png")
+    } else {
+        include_bytes!("../icons/tray-unread.png")
     };
     Image::from_bytes(bytes)
 }
@@ -59,10 +64,11 @@ pub fn set_count(app: &AppHandle, count: i64) {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
+    #[cfg(not(target_os = "macos"))]
     if let Ok(icon) = icon_for_count(count) {
-        let _ = tray.set_icon_with_as_template(Some(icon), false);
+        let _ = tray.set_icon(Some(icon));
     }
-    set_count_labels(app, &tray, count);
+    update_tray(app, &tray, count);
 }
 
 pub fn refresh(app: &AppHandle) {
@@ -73,7 +79,7 @@ pub fn refresh(app: &AppHandle) {
     }
 }
 
-fn set_count_labels(app: &AppHandle, tray: &TrayIcon, count: i64) {
+fn update_tray(app: &AppHandle, tray: &TrayIcon, count: i64) {
     let show_count = app
         .try_state::<Store>()
         .map(|store| store.preference_bool("show_unread_count", false))
@@ -90,4 +96,6 @@ fn set_count_labels(app: &AppHandle, tray: &TrayIcon, count: i64) {
         "Irisport · 暂无待查看结果".to_string()
     };
     let _ = tray.set_tooltip(Some(tooltip.as_str()));
+    #[cfg(target_os = "macos")]
+    macos::set_unread_appearance(tray, count > 0);
 }

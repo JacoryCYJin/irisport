@@ -1917,6 +1917,9 @@ name = "irisport"
 version = "0.1.0"
 dependencies = [
  "chromium-storage-localstorage-core",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "rusqlite",
  "serde",
  "serde_json",
