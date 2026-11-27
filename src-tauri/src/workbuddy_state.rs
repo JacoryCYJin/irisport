@@ -1,6 +1,6 @@
 use crate::paths;
 use crate::sources;
-use crate::store::{external_unread_key, SessionView, Store, StoreResult};
+use crate::store::{SessionView, Store, StoreResult};
 use crate::tray;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::thread;
@@ -11,19 +11,8 @@ pub fn start(app: AppHandle, store: Store) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_millis(500));
 
-        let unread = store
-            .unread_sessions()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(source, _)| source == sources::WORKBUDDY)
-            .collect::<Vec<_>>();
-        let running = store
-            .list_sessions()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|session| session.source == sources::WORKBUDDY && session.pending)
-            .collect::<Vec<_>>();
-        if unread.is_empty() && running.is_empty() {
+        let sessions = store.workbuddy_sync_sessions().unwrap_or_default();
+        if sessions.is_empty() {
             continue;
         }
 
@@ -40,33 +29,29 @@ pub fn start(app: AppHandle, store: Store) {
         let _ = conn.busy_timeout(Duration::from_millis(200));
 
         let mut changed = false;
-        for session in running {
+        for (session_id, pending) in sessions {
             let state = conn
                 .query_row(
-                    "SELECT status, last_activity_at FROM sessions WHERE id = ?1",
-                    params![session.session_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .optional();
-            if let Ok(Some((status, last_activity_at))) = state {
-                if let Ok(Some(completed)) =
-                    apply_external_lifecycle(&store, &session.session_id, &status, last_activity_at)
-                {
-                    changed = true;
-                    let _ = app.emit("task-completed", &completed);
-                }
-            }
-        }
-
-        for (_, session_id) in unread {
-            let state = conn
-                .query_row(
-                    "SELECT unread FROM sessions WHERE id = ?1",
+                    "SELECT status, last_activity_at, unread FROM sessions WHERE id = ?1",
                     params![session_id],
-                    |row| row.get::<_, i64>(0),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
                 )
                 .optional();
-            if let Ok(Some(external_unread)) = state {
+            if let Ok(Some((status, last_activity_at, external_unread))) = state {
+                if pending {
+                    if let Ok(Some(completed)) =
+                        apply_external_lifecycle(&store, &session_id, &status, last_activity_at)
+                    {
+                        changed = true;
+                        let _ = app.emit("task-completed", &completed);
+                    }
+                }
                 changed |=
                     apply_external_unread(&store, &session_id, external_unread).unwrap_or(false);
             }
@@ -105,10 +90,7 @@ fn apply_external_unread(
     external_unread: i64,
 ) -> StoreResult<bool> {
     match external_unread {
-        1 => {
-            store.meta_set(&external_unread_key(sources::WORKBUDDY, session_id), "1")?;
-            Ok(false)
-        }
+        1 => store.mark_external_unread(sources::WORKBUDDY, session_id),
         0 => store.mark_observed_session(sources::WORKBUDDY, session_id),
         _ => Ok(false),
     }
@@ -191,11 +173,12 @@ mod tests {
     }
 
     #[test]
-    fn default_read_state_does_not_clear_a_result() {
+    fn focused_result_stays_hidden_without_external_unread() {
         let (store, path) = store("default-read");
         store.apply(&stop("s1", "t1", 100)).unwrap();
         assert!(!apply_external_unread(&store, "s1", 0).unwrap());
-        assert_eq!(store.count_unread().unwrap(), 1);
+        assert_eq!(store.count_unread().unwrap(), 0);
+        assert!(store.list_sessions().unwrap().is_empty());
         let _ = std::fs::remove_file(path);
     }
 
@@ -203,10 +186,23 @@ mod tests {
     fn observed_unread_then_read_clears_the_result() {
         let (store, path) = store("observed");
         store.apply(&stop("s1", "t1", 100)).unwrap();
-        assert!(!apply_external_unread(&store, "s1", 1).unwrap());
+        assert!(apply_external_unread(&store, "s1", 1).unwrap());
+        assert_eq!(store.count_unread().unwrap(), 1);
         assert!(apply_external_unread(&store, "s1", 0).unwrap());
         assert_eq!(store.count_unread().unwrap(), 0);
         assert!(store.list_sessions().unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unread_during_running_appears_only_after_completion() {
+        let (store, path) = store("running-unread");
+        store.apply(&start("s1", "t1", 100)).unwrap();
+        assert!(!apply_external_unread(&store, "s1", 1).unwrap());
+        assert_eq!(store.count_unread().unwrap(), 0);
+        store.apply(&stop("s1", "t1", 200)).unwrap();
+        assert!(apply_external_unread(&store, "s1", 1).unwrap());
+        assert_eq!(store.count_unread().unwrap(), 1);
         let _ = std::fs::remove_file(path);
     }
 
@@ -215,9 +211,30 @@ mod tests {
         let (store, path) = store("new-result");
         store.apply(&stop("s1", "t1", 100)).unwrap();
         apply_external_unread(&store, "s1", 1).unwrap();
+        store.apply(&start("s1", "t2", 150)).unwrap();
         store.apply(&stop("s1", "t2", 200)).unwrap();
         assert!(!apply_external_unread(&store, "s1", 0).unwrap());
+        assert_eq!(store.count_unread().unwrap(), 0);
+        assert!(apply_external_unread(&store, "s1", 1).unwrap());
         assert_eq!(store.count_unread().unwrap(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_unobserved_reminder_is_hidden_without_becoming_seen() {
+        let (store, path) = store("legacy-repair");
+        store.apply(&stop("s1", "t1", 100)).unwrap();
+        store
+            .mark_external_unread(sources::WORKBUDDY, "s1")
+            .unwrap();
+        store
+            .meta_set("external_unread_observed:workbuddy:s1", "0")
+            .unwrap();
+        assert_eq!(store.repair_unobserved_external_unread().unwrap(), 1);
+        assert_eq!(store.count_unread().unwrap(), 0);
+        assert!(store.list_sessions().unwrap().is_empty());
+        assert_eq!(store.workbuddy_sync_sessions().unwrap().len(), 1);
+        assert_eq!(store.prune_seen().unwrap(), 0);
         let _ = std::fs::remove_file(path);
     }
 }
