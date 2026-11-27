@@ -1,6 +1,6 @@
 use crate::paths;
 use crate::sources;
-use crate::store::{external_unread_key, Store, StoreResult};
+use crate::store::{Store, StoreResult};
 use crate::tray;
 use chromium_storage_localstorage_core::{read_dir, LocalStorageRecord};
 use serde::{Deserialize, Serialize};
@@ -50,22 +50,12 @@ pub fn start(app: AppHandle, store: Store) {
 
         let mut changed = reconcile_cancelled_sessions(&store).unwrap_or(0) > 0;
 
-        let unread = store
-            .unread_sessions()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(source, _)| source == sources::KIMI_CODE)
-            .collect::<Vec<_>>();
-        let has_running = store
-            .list_sessions()
-            .unwrap_or_default()
-            .into_iter()
-            .any(|session| session.source == sources::KIMI_CODE && session.pending);
-        if !unread.is_empty() || has_running {
+        let sessions = store.kimi_sync_sessions().unwrap_or_default();
+        if !sessions.is_empty() {
             let path = paths::kimi_code_app_home().join("Local Storage/leveldb");
             if let Ok(Some(snapshot)) = read_unread_snapshot(&path) {
                 let _ = sync_unread_baselines(&store, &snapshot);
-                for (_, session_id) in unread {
+                for session_id in sessions {
                     changed |=
                         apply_unread_snapshot(&store, &session_id, &snapshot).unwrap_or(false);
                 }
@@ -254,7 +244,7 @@ fn apply_unread_snapshot(
             .map(|sequence| *sequence > baseline.sequence)
             .unwrap_or(false);
         if historical_unread && current != Some(true) {
-            store.meta_set(&external_unread_key(sources::KIMI_CODE, session_id), "1")?;
+            store.mark_external_unread(sources::KIMI_CODE, session_id)?;
             return store.mark_observed_session_turn(
                 sources::KIMI_CODE,
                 session_id,
@@ -271,10 +261,7 @@ fn apply_external_unread(
     external_unread: Option<bool>,
 ) -> StoreResult<bool> {
     match external_unread {
-        Some(true) => {
-            store.meta_set(&external_unread_key(sources::KIMI_CODE, session_id), "1")?;
-            Ok(false)
-        }
+        Some(true) => store.mark_external_unread(sources::KIMI_CODE, session_id),
         Some(false) | None => store.mark_observed_session(sources::KIMI_CODE, session_id),
     }
 }
@@ -389,7 +376,8 @@ mod tests {
         store.apply(&stop("s1", "t1", 100)).unwrap();
         assert!(!apply_external_unread(&store, "s1", None).unwrap());
         assert!(!apply_external_unread(&store, "s1", Some(false)).unwrap());
-        assert_eq!(store.count_unread().unwrap(), 1);
+        assert_eq!(store.count_unread().unwrap(), 0);
+        assert!(store.list_sessions().unwrap().is_empty());
         let _ = std::fs::remove_file(path);
     }
 
@@ -397,7 +385,7 @@ mod tests {
     fn true_then_absent_clears_after_viewing() {
         let (store, path) = store("removed");
         store.apply(&stop("s1", "t1", 100)).unwrap();
-        assert!(!apply_external_unread(&store, "s1", Some(true)).unwrap());
+        assert!(apply_external_unread(&store, "s1", Some(true)).unwrap());
         assert!(apply_external_unread(&store, "s1", None).unwrap());
         assert_eq!(store.count_unread().unwrap(), 0);
         let _ = std::fs::remove_file(path);
@@ -408,7 +396,8 @@ mod tests {
         let (store, path) = store("transition");
         store.apply(&stop("s1", "t1", 100)).unwrap();
         store.apply(&stop("s2", "t2", 200)).unwrap();
-        assert!(!apply_external_unread(&store, "s1", Some(true)).unwrap());
+        assert!(apply_external_unread(&store, "s1", Some(true)).unwrap());
+        assert!(apply_external_unread(&store, "s2", Some(true)).unwrap());
         assert!(apply_external_unread(&store, "s1", Some(false)).unwrap());
         assert_eq!(store.count_unread().unwrap(), 1);
         let remaining = store.list_sessions().unwrap();
@@ -451,7 +440,26 @@ mod tests {
         sync_unread_baselines(&store, &snapshot).unwrap();
         store.apply(&stop("s1", "t1", 200)).unwrap();
         assert!(!apply_unread_snapshot(&store, "s1", &snapshot).unwrap());
-        assert_eq!(store.count_unread().unwrap(), 1);
+        assert_eq!(store.count_unread().unwrap(), 0);
+        assert!(store.list_sessions().unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_unobserved_reminder_is_hidden_without_becoming_seen() {
+        let (store, path) = store("legacy-repair");
+        store.apply(&stop("s1", "t1", 100)).unwrap();
+        store
+            .mark_external_unread(sources::KIMI_CODE, "s1")
+            .unwrap();
+        store
+            .meta_set("external_unread_observed:kimi-code:s1", "0")
+            .unwrap();
+        assert_eq!(store.repair_unobserved_external_unread().unwrap(), 1);
+        assert_eq!(store.count_unread().unwrap(), 0);
+        assert!(store.list_sessions().unwrap().is_empty());
+        assert_eq!(store.kimi_sync_sessions().unwrap().len(), 1);
+        assert_eq!(store.prune_seen().unwrap(), 0);
         let _ = std::fs::remove_file(path);
     }
 

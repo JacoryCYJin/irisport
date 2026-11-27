@@ -16,7 +16,7 @@ pub fn create(app: &AppHandle, count: i64) -> tauri::Result<()> {
 
     let tray = TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon_for_count(count)?)
-        .icon_as_template(true)
+        .icon_as_template(false)
         .menu(&menu)
         .show_menu_on_left_click(false)
         .tooltip("Irisport")
@@ -60,7 +60,7 @@ pub fn set_count(app: &AppHandle, count: i64) {
         return;
     };
     if let Ok(icon) = icon_for_count(count) {
-        let _ = tray.set_icon_with_as_template(Some(icon), true);
+        let _ = tray.set_icon_with_as_template(Some(icon), false);
     }
     set_count_labels(app, &tray, count);
 }

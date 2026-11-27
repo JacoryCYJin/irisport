@@ -23,6 +23,7 @@ pub fn run(store: &Store) -> Result<(), String> {
             let _ = store.meta_remove("spool_offset");
         }
         let _ = fs::remove_file(paths::legacy_rejected_path());
+        store.repair_unobserved_external_unread()?;
         let _ = store.prune_seen();
         let _ = store.prune_handled();
         codex::compact_latency();
@@ -33,8 +34,8 @@ pub fn run(store: &Store) -> Result<(), String> {
     store.meta_set("migration_state", "draining")?;
 
     let hooks_configured = hooks_config::configured()?.0;
-    let had_legacy = paths::legacy_queue_path().exists()
-        || store.meta_get("spool_offset")?.is_some();
+    let had_legacy =
+        paths::legacy_queue_path().exists() || store.meta_get("spool_offset")?.is_some();
 
     let mut offset = store
         .meta_get("spool_offset")?
@@ -71,6 +72,7 @@ pub fn run(store: &Store) -> Result<(), String> {
 
     store.meta_set("legacy_quiet_at", &now_ms().to_string())?;
     store.migrate_seen_events()?;
+    store.repair_unobserved_external_unread()?;
     store.prune_seen()?;
     store.prune_handled()?;
 

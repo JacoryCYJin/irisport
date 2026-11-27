@@ -182,9 +182,24 @@ impl Store {
                     ],
                 )
                 .map_err(|error| error.to_string())?;
+                if matches!(source.as_str(), sources::WORKBUDDY | sources::KIMI_CODE) {
+                    tx.execute(
+                        "UPDATE sessions SET unread = 0, opened_at = NULL
+                         WHERE source = ?1 AND session_id = ?2 AND state = 'running'",
+                        params![source, event.session_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                if source == sources::WORKBUDDY {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, '0')",
+                        params![external_unread_key(&source, &event.session_id)],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
             }
             "stop" => {
-                tx.execute(
+                let changed = tx.execute(
                     "INSERT INTO sessions(
                        source, session_id, session_title, prompt_excerpt, cwd, client_type,
                        last_prompt_at, last_result_at, result_seq, unread, opened_at, state, active_turn_id, updated_at
@@ -215,7 +230,16 @@ impl Store {
                     ],
                 )
                 .map_err(|error| error.to_string())?;
-                if matches!(source.as_str(), sources::WORKBUDDY | sources::KIMI_CODE) {
+                if matches!(source.as_str(), sources::WORKBUDDY | sources::KIMI_CODE) && changed > 0
+                {
+                    tx.execute(
+                        "UPDATE sessions SET unread = 0, opened_at = NULL
+                         WHERE source = ?1 AND session_id = ?2",
+                        params![source, event.session_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                if source == sources::KIMI_CODE {
                     tx.execute(
                         "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, '0')",
                         params![external_unread_key(&source, &event.session_id)],
@@ -399,6 +423,73 @@ impl Store {
             .map_err(|error| error.to_string())
     }
 
+    pub fn workbuddy_sync_sessions(&self) -> StoreResult<Vec<(String, bool)>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT session_id, state FROM sessions
+                 WHERE source = 'workbuddy' AND (state = 'running' OR opened_at IS NULL)",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)? == "running",
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn kimi_sync_sessions(&self) -> StoreResult<Vec<String>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT session_id FROM sessions
+                 WHERE source = 'kimi-code' AND (state = 'running' OR opened_at IS NULL)",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    fn session_view_any(&self, source: &str, session_id: &str) -> StoreResult<Option<SessionView>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT source, session_id, session_title, prompt_excerpt, last_prompt_at,
+                    last_result_at, result_seq, unread, state, updated_at
+             FROM sessions WHERE source = ?1 AND session_id = ?2",
+            params![source, session_id],
+            |row| {
+                let source: String = row.get(0)?;
+                let last_prompt_at: Option<i64> = row.get(4)?;
+                let last_result_at: Option<i64> = row.get(5)?;
+                let state: String = row.get(8)?;
+                Ok(SessionView {
+                    source_label: sources::label(&source).to_string(),
+                    source,
+                    session_id: row.get(1)?,
+                    session_title: row.get(2)?,
+                    prompt_excerpt: row.get(3)?,
+                    last_prompt_at,
+                    last_result_at,
+                    result_seq: row.get(6)?,
+                    unread: row.get::<_, i64>(7)? != 0,
+                    pending: state == "running",
+                    state,
+                    updated_at: row.get(9)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+    }
+
     pub fn session_identity(
         &self,
         source: &str,
@@ -445,19 +536,20 @@ impl Store {
         ended_at: i64,
     ) -> StoreResult<Option<SessionView>> {
         let source = sources::canonical(source).to_string();
+        let unread = if source == sources::WORKBUDDY { 0 } else { 1 };
         let mut conn = self.lock()?;
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         let updated = tx
             .execute(
                 "UPDATE sessions SET
                    state = 'completed', last_result_at = ?1, result_seq = result_seq + 1,
-                   unread = 1, opened_at = NULL, updated_at = ?1
+                   unread = ?4, opened_at = NULL, updated_at = ?1
                  WHERE source = ?2 AND session_id = ?3 AND state = 'running'
                    AND COALESCE(last_prompt_at, 0) <= ?1",
-                params![ended_at, source, session_id],
+                params![ended_at, source, session_id, unread],
             )
             .map_err(|error| error.to_string())?;
-        if updated > 0 {
+        if updated > 0 && source != sources::WORKBUDDY {
             tx.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, '0')",
                 params![external_unread_key(&source, session_id)],
@@ -469,11 +561,28 @@ impl Store {
             return Ok(None);
         }
         drop(conn);
-        Ok(self.list_sessions()?.into_iter().find(|session| {
-            session.source == source
-                && session.session_id == session_id
-                && session.state == "completed"
-        }))
+        self.session_view_any(&source, session_id)
+    }
+
+    pub fn mark_external_unread(&self, source: &str, session_id: &str) -> StoreResult<bool> {
+        let source = sources::canonical(source);
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let changed = tx
+            .execute(
+                "UPDATE sessions SET unread = 1, opened_at = NULL, updated_at = ?1
+                 WHERE source = ?2 AND session_id = ?3
+                   AND unread = 0 AND state != 'running'",
+                params![now_ms(), source, session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, '1')",
+            params![external_unread_key(source, session_id)],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(changed > 0)
     }
 
     pub fn mark_seen_sessions(&self, sessions: &[(String, String)]) -> StoreResult<usize> {
@@ -660,6 +769,20 @@ impl Store {
         Ok(finalized)
     }
 
+    pub fn repair_unobserved_external_unread(&self) -> StoreResult<usize> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE sessions SET unread = 0, opened_at = NULL
+             WHERE source IN ('workbuddy', 'kimi-code') AND unread = 1 AND state != 'running'
+               AND COALESCE((
+                 SELECT value FROM meta
+                 WHERE key = 'external_unread_observed:' || sessions.source || ':' || sessions.session_id
+               ), '0') != '1'",
+            [],
+        )
+        .map_err(|error| error.to_string())
+    }
+
     pub fn prune_seen(&self) -> StoreResult<usize> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().map_err(|error| error.to_string())?;
@@ -673,6 +796,7 @@ impl Store {
                      WHERE unread = 0
                        AND last_result_at IS NOT NULL
                        AND COALESCE(last_prompt_at, 0) <= COALESCE(last_result_at, 0)
+                       AND (source NOT IN ('workbuddy', 'kimi-code') OR opened_at IS NOT NULL)
                        AND COALESCE(opened_at, 0) < ?1",
                 )
                 .map_err(|error| error.to_string())?;
@@ -693,6 +817,7 @@ impl Store {
                      WHERE unread = 0
                        AND last_result_at IS NOT NULL
                        AND COALESCE(last_prompt_at, 0) <= COALESCE(last_result_at, 0)
+                       AND (source NOT IN ('workbuddy', 'kimi-code') OR opened_at IS NOT NULL)
                      ORDER BY COALESCE(opened_at, 0) DESC
                      LIMIT -1 OFFSET ?1",
                 )
@@ -1138,6 +1263,7 @@ mod tests {
         store
             .apply(&source_event("kimi-code", "Stop", "shared", "k1", 200))
             .unwrap();
+        store.mark_external_unread("kimi-code", "shared").unwrap();
         let sessions = store.list_sessions().unwrap();
         assert_eq!(sessions.len(), 2);
         store
@@ -1324,7 +1450,10 @@ mod tests {
         store
             .apply(&source_event("workbuddy", "Stop", "s1", "stop-1", 200))
             .unwrap();
-        assert_eq!(store.list_sessions().unwrap()[0].state, "completed");
+        assert!(store.list_sessions().unwrap().is_empty());
+        let sessions = store.workbuddy_sync_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(!sessions[0].1);
     }
 
     #[test]
@@ -1342,7 +1471,8 @@ mod tests {
         store
             .apply(&source_event("kimi-code", "Stop", "s1", "stop-200", 200))
             .unwrap();
-        assert_eq!(store.list_sessions().unwrap()[0].state, "completed");
+        assert!(store.list_sessions().unwrap().is_empty());
+        assert_eq!(store.kimi_sync_sessions().unwrap().len(), 1);
     }
 
     #[test]
